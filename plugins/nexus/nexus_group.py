@@ -31,6 +31,7 @@ v3.1 — Perubahan passive learning:
 
 import os
 import re
+import html
 import asyncio
 from datetime import datetime, timezone, timedelta
 
@@ -49,6 +50,9 @@ from database import (
     delete_queue,
     db,
     is_message_handled,
+    get_config,
+    check_bot_permissions,
+    is_admin,
 )
 
 _free_col   = db["free_per_group"]
@@ -57,6 +61,7 @@ TZ_WIB      = timezone(timedelta(hours=7))
 
 from plugins.nexus.engine import pipeline_pembersihan, generate_regex_otomatis_async
 from core.punishment import check_and_punish
+from core.violation_types import VIOLATION_NEXUS_AI, VIOLATION_WHITELIST_SPARED, format_violation_header
 import admin_session as _adm_sess
 
 # ── [NEXUS AI CORE v3.1] Import — non-fatal jika tidak ada ───────────────────
@@ -77,7 +82,7 @@ except Exception as _ai_import_err:
 
 # ── /spam — Admin grup lapor spam ─────────────────────────────────────────────
 
-@Client.on_message(filters.command("spam") & filters.group)
+@Client.on_message(filters.command("spam") & (filters.group | filters.forum))
 async def nexus_spam_handler(client: Client, message: Message):
     cid = message.chat.id
     uid = message.from_user.id if message.from_user else None
@@ -97,7 +102,7 @@ async def nexus_spam_handler(client: Client, message: Message):
         return
 
     await nexus_insert_kalimat(teks_clean)
-    await nexus_track_grup(cid, message.chat.title or str(cid))
+    await nexus_track_grup(cid, message.chat.title or str(cid), message.chat.username)
 
     # ── [NEXUS AI CORE] Online learning dari laporan /spam ────────────────────
     if _AI_CORE_AVAILABLE:
@@ -280,13 +285,97 @@ def _sp_set_covered(sp_set: frozenset[str], wl_set: frozenset[str]) -> bool:
     return all(_alt_is_covered_by_wl_set(sp_alt, wl_set) for sp_alt in sp_set)
 
 
+def _extract_trigger_words(cat_reasons: list[str]) -> list[str]:
+    """
+    Ekstrak kata pemicu dari reasons CategoryDetector.
+
+    Reasons berformat: "kata porno eksplisit: nakal", "kata suggestif: sensual", dll.
+    Fungsi ini mengambil bagian setelah ":" sebagai kata pemicu.
+    Juga menangkap kata langsung jika tidak ada format ":".
+    """
+    triggers = []
+    for reason in cat_reasons:
+        if ":" in reason:
+            # Ambil bagian setelah ":" dan bersihkan
+            after_colon = reason.split(":", 1)[1].strip().lower()
+            # Bisa berisi beberapa kata — ambil kata pertama yang berarti
+            # (biasanya hasil .group()[:30] dari regex)
+            word = after_colon.split()[0] if after_colon else ""
+            if word:
+                triggers.append(word)
+    return triggers
+
+
+def _is_category_whitelisted(
+    cat_reasons: list[str],
+    content: str,
+    whitelist_docs: list[dict],
+) -> tuple[bool, dict | None]:
+    """
+    Cek apakah hasil CategoryDetector dilindungi whitelist owner berdasarkan kata.
+
+    Logika KETAT (v3.2):
+    - Ekstrak SEMUA kata pemicu dari reasons CategoryDetector
+    - Untuk setiap doc whitelist, cek apakah SEMUA kata pemicu tercakup
+      oleh kata_list dalam 1 doc tersebut
+    - Jika ada kata pemicu yang tidak tercakup → TIDAK aman, pesan tetap dihapus
+    - Semua kata pemicu harus tercakup oleh SATU pola whitelist yang sama
+
+    Contoh:
+      Pemicu: ["nakal"]
+      Whitelist doc kata_list: ["saya", "ada", "nakal", "aku"]
+      → "nakal" ada → AMAN ✅
+
+      Pemicu: ["nakal", "bokep"]
+      Whitelist doc kata_list: ["nakal"]
+      → "bokep" tidak ada di doc manapun → HAPUS ❌
+
+      Pemicu: ["nakal", "bokep"]
+      Whitelist doc kata_list: ["nakal", "bokep"]
+      → semua ada di 1 doc → AMAN ✅
+    """
+    if not whitelist_docs or not cat_reasons:
+        return False, None
+
+    # Ekstrak kata-kata pemicu dari reasons
+    trigger_words = _extract_trigger_words(cat_reasons)
+    if not trigger_words:
+        return False, None
+
+    # Cek setiap doc whitelist: apakah SEMUA trigger tercakup oleh kata_list-nya?
+    for doc in whitelist_docs:
+        kata_list = doc.get("kata_list", [])
+        if not kata_list:
+            # Fallback: parse dari field raw
+            raw = doc.get("raw", "")
+            if raw and raw != "—":
+                kata_list = [k.strip().lower() for k in raw.split("|") if k.strip()]
+        else:
+            kata_list = [k.lower() for k in kata_list if k]
+
+        if not kata_list:
+            continue
+
+        # Semua trigger harus ada di kata_list doc ini
+        all_covered = all(
+            any(trigger in wl_kata or wl_kata in trigger for wl_kata in kata_list)
+            for trigger in trigger_words
+        )
+
+        if all_covered:
+            return True, doc
+
+    return False, None
+
+
 def _is_whitelisted(spam_pola: str, whitelist_docs: list[dict]) -> tuple[bool, dict | None]:
     """
     Cek apakah pola spam dilindungi Whitelist Nexus.
     Whitelist hanya berlaku untuk pola dari nexus_regex_db (bukan CategoryDetector).
     Pola kategori ([CAT-*]) TIDAK diperiksa ke whitelist — langsung dieksekusi.
+    Untuk CategoryDetector, gunakan _is_category_whitelisted() terpisah.
     """
-    # Pola dari CategoryDetector atau AI tidak memiliki whitelist (langsung hapus)
+    # Pola dari CategoryDetector atau AI tidak memiliki whitelist di sini (pakai fungsi khusus)
     if spam_pola.startswith("[NEXUS_CATEGORY_DETECTOR]") or spam_pola.startswith("[NEXUS_AI_CORE"):
         return False, None
 
@@ -358,7 +447,7 @@ async def _log_nexus_deleted(
 
     uid          = message.from_user.id
     cid          = message.chat.id
-    user_mention = f"<a href='tg://user?id={uid}'>{message.from_user.first_name}</a>"
+    user_mention = f"<a href='tg://user?id={uid}'>{html.escape(message.from_user.first_name or str(uid))}</a>"
     waktu        = datetime.now(TZ_WIB).strftime("%d/%m/%Y %H:%M:%S WIB")
 
     kata_display = kata_kunci.split("]", 1)[-1].strip() if "]" in kata_kunci else kata_kunci
@@ -372,16 +461,14 @@ async def _log_nexus_deleted(
         sumber = "📋 Regex Database"
 
     text = (
-        "<b>❖ NEXUS AI — PESAN DIHAPUS ❖</b>\n\n"
-        f"🗑️ <b>Eksekusi Filter: {sumber}</b>\n"
+        f"<b>❖ {format_violation_header(VIOLATION_NEXUS_AI)} ❖</b>\n"
+        f"◈ <b>Sumber deteksi:</b> {sumber}\n"
         f"◈ <b>User:</b> {user_mention} (<code>{uid}</code>)\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
-        f"◈ <b>Waktu:</b> <code>{waktu}</code>\n\n"
-        "<b>▰▰▰ PEMICU SPAM AI ▰▰▰</b>\n"
-        f"🔑 <b>Kata Kunci Pemicu:</b> <code>{kata_display}</code>\n"
-        f"💥 <b>Pola Interlock:</b>\n<code>{pola_str[:300]}</code>\n\n"
-        "<b>▰▰▰ KONTEN PESAN ▰▰▰</b>\n"
-        f"<code>{content[:400]}</code>"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
+        f"◈ <b>Waktu:</b> {waktu}\n"
+        f"◈ <b>Kata kunci pemicu:</b> <code>{html.escape(str(kata_display))}</code>\n"
+        f"◈ <b>Pola interlock:</b> <code>{html.escape(str(pola_str)[:300])}</code>\n\n"
+        f"📨 <b>Konten:</b>\n<code>{html.escape(content[:400])}</code>"
     )
     try:
         await client.send_message(
@@ -406,30 +493,27 @@ async def _log_nexus_whitelist_spared(
 
     uid          = message.from_user.id
     cid          = message.chat.id
-    user_mention = f"<a href='tg://user?id={uid}'>{message.from_user.first_name}</a>"
+    user_mention = f"<a href='tg://user?id={uid}'>{html.escape(message.from_user.first_name or str(uid))}</a>"
     waktu        = datetime.now(TZ_WIB).strftime("%d/%m/%Y %H:%M:%S WIB")
 
     kata_display = kata_kunci.split("]", 1)[-1].strip() if "]" in kata_kunci else kata_kunci
     wl_raw       = wl_doc.get("raw", "—")
     wl_kata_list = wl_doc.get("kata_list", [])
     wl_pola      = wl_doc.get("pola", "")
-    wl_kata_str  = ", ".join(f"<code>{k}</code>" for k in wl_kata_list) if wl_kata_list else f"<code>{wl_raw}</code>"
+    wl_raw_safe  = html.escape(str(wl_raw))
+    wl_kata_str  = ", ".join(f"<code>{html.escape(str(k))}</code>" for k in wl_kata_list) if wl_kata_list else f"<code>{wl_raw_safe}</code>"
 
     text = (
-        "<b>❖ NEXUS AI — PESAN DIAMANKAN WHITELIST ❖</b>\n\n"
-        "🛡️ <b>Pesan Lolos Penghapusan (Dilindungi Whitelist Nexus)</b>\n"
+        f"<b>❖ {format_violation_header(VIOLATION_WHITELIST_SPARED)} ❖</b>\n"
         f"◈ <b>User:</b> {user_mention} (<code>{uid}</code>)\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
-        f"◈ <b>Waktu:</b> <code>{waktu}</code>\n\n"
-        "<b>▰▰▰ POLA SPAM AI YANG TERPICU ▰▰▰</b>\n"
-        f"🔑 <b>Kata Kunci Spam:</b> <code>{kata_display}</code>\n"
-        f"💥 <b>Pola Interlock Spam:</b>\n<code>{spam_pola[:300]}</code>\n\n"
-        "<b>▰▰▰ DILINDUNGI OLEH WHITELIST NEXUS ▰▰▰</b>\n"
-        f"🛡️ <b>Kata Aman:</b> {wl_kata_str}\n"
-        f"📝 <b>Raw Whitelist:</b> <code>{wl_raw}</code>\n"
-        f"🔒 <b>Pola Whitelist:</b>\n<code>{wl_pola[:300]}</code>\n\n"
-        "<b>▰▰▰ KONTEN PESAN ▰▰▰</b>\n"
-        f"<code>{content[:400]}</code>"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
+        f"◈ <b>Waktu:</b> {waktu}\n"
+        f"◈ <b>Kata kunci spam terpicu:</b> <code>{html.escape(str(kata_display))}</code>\n"
+        f"◈ <b>Pola interlock spam:</b> <code>{html.escape(str(spam_pola)[:300])}</code>\n"
+        f"◈ <b>Dilindungi whitelist:</b> {wl_kata_str}\n"
+        f"◈ <b>Raw whitelist:</b> <code>{wl_raw_safe}</code>\n"
+        f"◈ <b>Pola whitelist:</b> <code>{html.escape(str(wl_pola)[:300])}</code>\n\n"
+        f"📨 <b>Konten:</b>\n<code>{html.escape(content[:400])}</code>"
     )
     try:
         await client.send_message(
@@ -453,7 +537,7 @@ async def _log_nexus_keroyok(
 
     uid          = message.from_user.id
     cid          = message.chat.id
-    user_mention = f"<a href='tg://user?id={uid}'>{message.from_user.first_name}</a>"
+    user_mention = f"<a href='tg://user?id={uid}'>{html.escape(message.from_user.first_name or str(uid))}</a>"
     waktu        = datetime.now(TZ_WIB).strftime("%d/%m/%Y %H:%M:%S WIB")
     jumlah_racun = len(semua_pola)
 
@@ -461,8 +545,8 @@ async def _log_nexus_keroyok(
     for i, (kk, ps) in enumerate(semua_pola, 1):
         kk_display = kk.split("]", 1)[-1].strip() if "]" in kk else kk
         daftar_racun += (
-            f"<b>Racun #{i}:</b> <code>{kk_display}</code>\n"
-            f"<code>{ps[:200]}</code>\n\n"
+            f"<b>Racun #{i}:</b> <code>{html.escape(str(kk_display))}</code>\n"
+            f"<code>{html.escape(str(ps)[:200])}</code>\n\n"
         )
 
     if pola_tanpa_penawar:
@@ -470,8 +554,8 @@ async def _log_nexus_keroyok(
         for i, (kk, ps) in enumerate(pola_tanpa_penawar, 1):
             kk_display = kk.split("]", 1)[-1].strip() if "]" in kk else kk
             daftar_tanpa_penawar += (
-                f"<b>Pola #{i}:</b> <code>{kk_display}</code>\n"
-                f"<code>{ps[:200]}</code>\n\n"
+                f"<b>Pola #{i}:</b> <code>{html.escape(str(kk_display))}</code>\n"
+                f"<code>{html.escape(str(ps)[:200])}</code>\n\n"
             )
         info_penawar = (
             "<b>▰▰▰ RACUN TANPA PENAWAR ▰▰▰</b>\n"
@@ -489,19 +573,15 @@ async def _log_nexus_keroyok(
         )
 
     text = (
-        "<b>❖ NEXUS AI — PESAN DIHAPUS (ATURAN KEROYOKAN) ❖</b>\n\n"
-        "☠️ <b>Eksekusi Filter: MULTI-PATTERN AMBUSH</b>\n"
+        f"<b>❖ {format_violation_header(VIOLATION_NEXUS_AI)} (Multi-Pola) ❖</b>\n"
         f"◈ <b>User:</b> {user_mention} (<code>{uid}</code>)\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
-        f"◈ <b>Waktu:</b> <code>{waktu}</code>\n\n"
-        f"⚠️ <b>{jumlah_racun} pola spam berbeda mendeteksi kecocokan sekaligus!</b>\n"
-        "<i>Whitelist tidak berlaku — satu penawar tidak bisa menetralkan "
-        "semua racun sekaligus.</i>\n\n"
-        "<b>▰▰▰ SEMUA POLA YANG TERPICU ▰▰▰</b>\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
+        f"◈ <b>Waktu:</b> {waktu}\n"
+        f"◈ <b>Keterangan:</b> {jumlah_racun} pola spam berbeda cocok sekaligus — "
+        "whitelist individual tidak berlaku untuk kasus keroyokan\n\n"
         f"{daftar_racun}"
         f"{info_penawar}"
-        "<b>▰▰▰ KONTEN PESAN ▰▰▰</b>\n"
-        f"<code>{content[:400]}</code>"
+        f"📨 <b>Konten:</b>\n<code>{html.escape(content[:400])}</code>"
     )
     try:
         await client.send_message(
@@ -536,7 +616,7 @@ def _is_category_based(kata_kunci: str) -> bool:
 
 # ── Silent Filter ──────────────────────────────────────────────────────────────
 
-@Client.on_message(filters.group & ~filters.service, group=5)
+@Client.on_message((filters.group | filters.forum) & ~filters.service, group=5)
 async def nexus_silent_filter(client: Client, message: Message):
     if not message.from_user:
         return
@@ -549,6 +629,21 @@ async def nexus_silent_filter(client: Client, message: Message):
     if is_message_handled(cid, mid):
         return
 
+    # ── Cek izin bot ─────────────────────────────────────────────────────────
+    # Jika tidak punya izin → passive learning nexus AI tetap jalan
+    # (datanya berguna untuk seluruh sistem), tapi eksekusi hapus di-skip.
+    _nexus_has_perms = await check_bot_permissions(client, cid)
+    if not _nexus_has_perms:
+        # Tetap jalankan passive observe untuk AI learning
+        if _AI_CORE_AVAILABLE:
+            _np_content = (message.text or message.caption or "").strip()
+            if _np_content:
+                asyncio.create_task(_ai_passive_background(_np_content, False, 0.0))
+        return
+
+    if await is_admin(client, cid, uid):
+        return
+
     # VIP: bebas dari seluruh filter Nexus AI
     try:
         if await _free_col.find_one({"user_id": uid, "chat_id": cid}):
@@ -559,6 +654,17 @@ async def nexus_silent_filter(client: Client, message: Message):
 
     content = (message.text or message.caption or "").strip()
     if not content or content.startswith("/"):
+        return
+
+    # ── Anti Spam AI: skip Nexus AI murni & auto regex jika fitur nonaktif ───
+    # Owner regex (antispam.py) tetap berjalan di handler terpisah (group=2).
+    # Di sini hanya nexus_regex + CategoryDetector + AI Bayes yang diblokir.
+    try:
+        _grp_cfg = await get_config(cid)
+        if not _grp_cfg.get("anti_spam_ai", False):
+            return
+    except Exception as _cfg_err:
+        print(f"[nexus_silent_filter] gagal cek anti_spam_ai config: {_cfg_err}")
         return
 
     teks_clean = pipeline_pembersihan(content)
@@ -611,6 +717,40 @@ async def nexus_silent_filter(client: Client, message: Message):
                         ],
                         all_scores = cat_result.all_scores,
                     )
+
+                    # ── [NEXUS WHITELIST v3.2] Cek whitelist owner untuk CategoryDetector ──
+                    # Jika kata pemicu ada di whitelist owner → bebaskan pesan, jangan hapus
+                    try:
+                        _cat_safe, _cat_wl_doc = _is_category_whitelisted(
+                            adj_result.reasons, content, whitelist_docs
+                        )
+                    except Exception as _cwl_err:
+                        print(f"[nexus_silent_filter] category whitelist check error: {_cwl_err}")
+                        _cat_safe, _cat_wl_doc = False, None
+
+                    if _cat_safe:
+                        # Log pesan dibebaskan whitelist
+                        asyncio.create_task(_log_nexus_whitelist_spared(
+                            client, message,
+                            adj_result.as_kata_kunci(),
+                            adj_result.as_pola_str(),
+                            _cat_wl_doc or {},
+                            content,
+                        ))
+                        asyncio.create_task(nexus_actlog_insert(
+                            aksi       = "WHITELIST",
+                            user_id    = uid,
+                            user_name  = (message.from_user.first_name or str(uid))[:60],
+                            chat_id    = cid,
+                            chat_title = (message.chat.title or str(cid))[:60],
+                            alasan     = adj_result.as_kata_kunci()[:200],
+                            confidence = 0.0,
+                            content    = content,
+                        ))
+                        if _AI_CORE_AVAILABLE:
+                            asyncio.create_task(_ai_passive_background(content, False, 0.0))
+                        return   # Dilindungi whitelist owner → biarkan pesan
+
                     matched.append((adj_result.as_kata_kunci(), adj_result.as_pola_str()))
         except Exception as _cat_err:
             print(f"[nexus_silent_filter] CategoryDetector error (non-fatal): {_cat_err}")
@@ -623,10 +763,7 @@ async def nexus_silent_filter(client: Client, message: Message):
     if not matched and _AI_CORE_AVAILABLE:
         try:
             _meta = {
-                "is_forwarded": bool(
-                    getattr(message, "forward_from", None)
-                    or getattr(message, "forward_from_chat", None)
-                ),
+                "is_forwarded": bool(getattr(message, "forward_origin", None)),
                 "has_bio_link": False,
             }
             _ai_result = await nexus_ai_auto_detect(
@@ -699,9 +836,10 @@ async def nexus_silent_filter(client: Client, message: Message):
         # FIXED: Tulis juga ke group_action_log agar muncul di panel "Log Aktivitas"
         asyncio.create_task(insert_group_action_log(
             cid, "HAPUS",
-            f"Nexus AI: {(kata_kunci.split(']', 1)[-1].strip() if ']' in kata_kunci else kata_kunci)[:80]}",
+            f"Nexus AI — {(kata_kunci.split(']', 1)[-1].strip() if ']' in kata_kunci else kata_kunci)[:80]}",
             uid, (message.from_user.first_name or str(uid))[:50],
             content[:100],
+            jenis=VIOLATION_NEXUS_AI,
         ))
         # [PASSIVE LEARNING] Pesan dihapus → AI auto-learn spam
         # force_learn=True untuk CategoryDetector (rule-based, sudah pasti spam)
@@ -770,9 +908,10 @@ async def nexus_silent_filter(client: Client, message: Message):
     # FIXED: Tulis juga ke group_action_log agar muncul di panel "Log Aktivitas"
     asyncio.create_task(insert_group_action_log(
         cid, "HAPUS",
-        f"Nexus AI multi-pola ({len(matched)}): {_alasan_keroyok[:80]}",
+        f"Nexus AI Multi-Pola ({len(matched)} cocok) — {_alasan_keroyok[:80]}",
         uid, (message.from_user.first_name or str(uid))[:50],
         content[:100],
+        jenis=VIOLATION_NEXUS_AI,
     ))
     # [PASSIVE LEARNING] Keroyokan = spam sangat meyakinkan → auto-learn paksa
     if _AI_CORE_AVAILABLE:
@@ -791,7 +930,7 @@ async def nexus_silent_filter(client: Client, message: Message):
 async def nexus_tracking_grup(client: Client, update: ChatMemberUpdated):
     try:
         from pyrogram.enums import ChatType
-        me = await client.get_me()
+        me = client.me
         if not update.new_chat_member or update.new_chat_member.user.id != me.id:
             return
 
@@ -808,7 +947,7 @@ async def nexus_tracking_grup(client: Client, update: ChatMemberUpdated):
         if new_status in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT):
             await nexus_remove_grup(chat_id)
         elif new_status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
-            await nexus_track_grup(chat_id, update.chat.title or str(chat_id))
+            await nexus_track_grup(chat_id, update.chat.title or str(chat_id), update.chat.username)
     except Exception as e:
         print(f"[nexus_tracking_grup] {e}")
 

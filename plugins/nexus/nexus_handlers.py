@@ -26,6 +26,7 @@ STRUKTUR MENU:
 import re
 import asyncio
 import unicodedata
+from html import escape as _html_escape
 
 import pytz
 from pyrogram import Client, filters
@@ -42,6 +43,7 @@ from database import (
     nexus_get_regex_page,
     nexus_get_kalimat_page,
     nexus_get_all_grup,
+    nexus_track_grup,
     nexus_delete_kalimat,
     nexus_delete_kalimat_by_id,
     nexus_delete_regex_by_pola,
@@ -58,6 +60,8 @@ from database import (
     nexus_actlog_count,
     nexus_actlog_clear,
     regex_db,
+    get_owner_regex_count,
+    invalidate_nexus_counts,
 )
 from plugins.nexus.engine import (
     pipeline_pembersihan,
@@ -91,8 +95,11 @@ _whitelist_fsm:   dict[int, int] = {}   # FSM untuk input whitelist regex
 async def _welcome_text() -> str:
     total, antrean = await nexus_get_kalimat_count()
     total_regex    = await nexus_get_regex_count()
-    owner_regex_ct = await regex_db.count_documents({})
+    owner_regex_ct = await get_owner_regex_count()
     wl_ct          = await nexus_whitelist_count()
+    from database import get_bot_config
+    auto_gen_on = await get_bot_config("nexus_auto_gen_enabled", default=True)
+    auto_gen_label = "✅ Aktif" if auto_gen_on is not False else "⏸️ Dimatikan"
     return (
         "🤖 **NEXUS AI ENGINE**\n"
         "_Adaptive Regex Engine · Belajar dari Laporan Spam_\n"
@@ -106,7 +113,8 @@ async def _welcome_text() -> str:
         f"├─ 🔮 `Pola AI (Auto)`      : **{total_regex} interlock regex**\n"
         f"├─ ⚙️ `Pola Manual (Owner)` : **{owner_regex_ct} regex**\n"
         f"├─ 🛡️ `Whitelist Nexus`     : **{wl_ct} pengecualian**\n"
-        "└─ 🕛 `Siklus Rekalkulasi`   : **Setiap 00:00 WIB**\n"
+        f"├─ 🕛 `Siklus Rekalkulasi`   : **Setiap 00:00 WIB**\n"
+        f"└─ 🔄 `Auto-Generate`        : **{auto_gen_label}**\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "_Engine berjalan otomatis. Pilih panel di bawah:_"
     )
@@ -116,7 +124,7 @@ def _main_markup(username_bot: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
             "➕  Aktifkan di Grup",
-            url=f"https://t.me/{username_bot}?startgroup=true&admin=delete_messages+ban_users"
+            callback_data="pasang_bot"
         )],
         [
             InlineKeyboardButton("📚  Manual AI",        callback_data="nx_tutorial"),
@@ -143,12 +151,53 @@ def _back_global_regex() -> InlineKeyboardMarkup:
 
 
 async def _safe_edit(msg, text: str, keyboard=None):
+    """
+    Edit pesan panel dengan proteksi FloodWait.
+    Jika kena FloodWait, tunggu durasi yang diminta lalu retry sekali —
+    panel nexus owner-only tapi tetap harus tahan di kondisi API sibuk.
+    """
+    from pyrogram.errors import FloodWait as _FW
     try:
         await msg.edit(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
     except MessageNotModified:
         pass
+    except _FW as fw:
+        wait = min(fw.value, 10)   # tunggu maks 10 detik, tidak lebih
+        await asyncio.sleep(wait)
+        try:
+            await msg.edit(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        except Exception as e2:
+            print(f"[nexus safe_edit] retry gagal: {e2}")
     except Exception as e:
         print(f"[nexus safe_edit] {e}")
+
+
+async def _safe_edit_html(msg, text: str, keyboard=None):
+    """
+    Sama seperti _safe_edit, tapi parse_mode=HTML.
+
+    DIPAKAI KHUSUS untuk halaman yang merender teks bebas dari user/grup
+    (mis. judul grup di nx_list_grup) — Markdown legacy Pyrogram TIDAK
+    mendukung backslash-escape (\\* tidak "dimakan" parser seperti di
+    MarkdownV2 Bot API resmi), sehingga judul yang mengandung karakter
+    delimiter (*, _, `, [) selalu berisiko merusak parsing baris setelahnya
+    walau sudah di-escape manual. HTML jauh lebih aman karena html.escape()
+    benar-benar menetralkan &, <, > — tidak ada lagi delimiter yang lolos.
+    """
+    from pyrogram.errors import FloodWait as _FW
+    try:
+        await msg.edit(text, reply_markup=keyboard, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except MessageNotModified:
+        pass
+    except _FW as fw:
+        wait = min(fw.value, 10)
+        await asyncio.sleep(wait)
+        try:
+            await msg.edit(text, reply_markup=keyboard, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except Exception as e2:
+            print(f"[nexus safe_edit_html] retry gagal: {e2}")
+    except Exception as e:
+        print(f"[nexus safe_edit_html] {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -178,11 +227,19 @@ async def nexus_del_handler(client: Client, message: Message):
         if not deleted and teks_clean != input_target:
             deleted = await nexus_delete_kalimat(teks_clean)
         if deleted:
-            await generate_regex_otomatis_async()
-            await message.reply(
-                f"🗑️ **PURGE & RESYNC BERHASIL**\n📝 `{input_target}` dihancurkan dan regex di-recalculate.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            auto_gen_on = await get_bot_config("nexus_auto_gen_enabled", default=True)
+            if auto_gen_on is not False:
+                await generate_regex_otomatis_async()
+                await message.reply(
+                    f"🗑️ **PURGE & RESYNC BERHASIL**\n📝 `{input_target}` dihancurkan dan regex di-recalculate.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            else:
+                await message.reply(
+                    f"🗑️ **PURGE BERHASIL**\n📝 `{input_target}` dihancurkan dari korpus.\n"
+                    f"⏸️ Auto-generate OFF — regex tidak di-recalculate.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
         else:
             await message.reply("❌ Kalimat tidak ditemukan di Nexus database.")
 
@@ -402,6 +459,7 @@ async def nexus_direct_add_regex(client: Client, message: Message):
         }},
         upsert=True,
     )
+    invalidate_nexus_counts()
 
     hasil_respon = (
         f"✅ **DIRECT INJECTION SUCCESS!**\n"
@@ -618,6 +676,7 @@ async def nexus_owner_regex_fsm(client: Client, message: Message):
         }},
         upsert=True,
     )
+    invalidate_nexus_counts()
 
     header = f"✅ **`{raw_joined}`** Full Interlock berhasil dikunci ke Core Database!\n\n"
     await _render_owner_regex_page(client, message.chat.id, msg_id, 1, header=header)
@@ -630,7 +689,7 @@ async def nexus_owner_regex_fsm(client: Client, message: Message):
 async def _render_owner_regex_page(client, chat_id: int, msg_id: int, page: int, header: str = ""):
     limit  = 5
     offset = (page - 1) * limit
-    total  = await regex_db.count_documents({})
+    total  = await get_owner_regex_count()
     docs   = [doc async for doc in regex_db.find({}).sort("_id", -1).skip(offset).limit(limit)]
     total_pages = max(1, (total + limit - 1) // limit)
 
@@ -804,7 +863,7 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
             await cq.answer()
         except Exception:
             pass
-        me   = await client.get_me()
+        me   = client.me
         text = await _welcome_text()
         await _safe_edit(cq.message, text, _main_markup(me.username))
 
@@ -894,6 +953,9 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
             await cq.answer()
         except Exception:
             pass
+        from database import get_bot_config
+        auto_gen_on = await get_bot_config("nexus_auto_gen_enabled", default=True)
+        auto_gen_label = "🔄 Auto-Gen: ✅ ON" if auto_gen_on is not False else "🔄 Auto-Gen: ⏸️ OFF"
         await _safe_edit(
             cq.message,
             "👑 **PANEL KHUSUS OWNER BOT**\n"
@@ -916,6 +978,7 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
                     InlineKeyboardButton("🔬  Debug AI (24j)",  callback_data="nx_ai_debug_page_1"),
                     InlineKeyboardButton("🗑️  Reset Integrasi", callback_data="nx_menu_reset"),
                 ],
+                [InlineKeyboardButton(auto_gen_label,            callback_data="nx_toggle_autogen")],
                 [InlineKeyboardButton("📱  Ganti Userbot",       callback_data="nx_setuserbot")],
                 [InlineKeyboardButton("🔙  Kembali ke Nexus",   callback_data="nx_home")],
             ])
@@ -978,6 +1041,53 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
         if user_id in _pending_setuserbot:
             _pending_setuserbot[user_id]["_task"] = task
 
+    elif data == "nx_toggle_autogen":
+        if user_id != OWNER_ID:
+            try:
+                await cq.answer("🔒 Hanya Owner bot.", show_alert=True)
+            except Exception:
+                pass
+            return
+        from database import get_bot_config, save_bot_config
+        current = await get_bot_config("nexus_auto_gen_enabled", default=True)
+        # Toggle: kalau sekarang True/None → matikan (False), kalau False → nyalakan (True)
+        new_val = False if current is not False else True
+        await save_bot_config("nexus_auto_gen_enabled", new_val)
+        label   = "✅ DINYALAKAN" if new_val else "⏸️ DIMATIKAN"
+        try:
+            await cq.answer(f"Auto-Generate {label}", show_alert=True)
+        except Exception:
+            pass
+        # Refresh owner panel supaya label tombol langsung berubah
+        auto_gen_label = "🔄 Auto-Gen: ✅ ON" if new_val else "🔄 Auto-Gen: ⏸️ OFF"
+        await _safe_edit(
+            cq.message,
+            "👑 **PANEL KHUSUS OWNER BOT**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Akses kontrol penuh ke dalam core system Nexus AI.",
+            InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("📊  Record Data",      callback_data="nx_records_page_1"),
+                    InlineKeyboardButton("📂  Grup Terdaftar",   callback_data="nx_list_grup"),
+                ],
+                [
+                    InlineKeyboardButton("⚡  Paksa Kalkulasi",  callback_data="nx_force_calc"),
+                    InlineKeyboardButton("🔄  Refresh Metrik",   callback_data="nx_refresh"),
+                ],
+                [
+                    InlineKeyboardButton("🧠  Lihat AI",         callback_data="nx_lihat_ai"),
+                    InlineKeyboardButton("📋  Log Aktivitas",    callback_data="nx_actlog_page_1"),
+                ],
+                [
+                    InlineKeyboardButton("🔬  Debug AI (24j)",  callback_data="nx_ai_debug_page_1"),
+                    InlineKeyboardButton("🗑️  Reset Integrasi", callback_data="nx_menu_reset"),
+                ],
+                [InlineKeyboardButton(auto_gen_label,            callback_data="nx_toggle_autogen")],
+                [InlineKeyboardButton("📱  Ganti Userbot",       callback_data="nx_setuserbot")],
+                [InlineKeyboardButton("🔙  Kembali ke Nexus",   callback_data="nx_home")],
+            ])
+        )
+
     elif data == "nx_list_grup":
         if user_id != OWNER_ID:
             try:
@@ -989,17 +1099,55 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
                 pass
             return
         try:
-            await cq.answer()
+            await cq.answer("⏳ Memuat daftar grup...")
         except Exception:
             pass
+
+        # HTML dipakai di sini (bukan Markdown seperti halaman Nexus lain) —
+        # judul grup adalah teks BEBAS dari user, dan Markdown legacy Pyrogram
+        # tidak mendukung backslash-escape (\* tidak "dimakan" parser seperti
+        # MarkdownV2 Bot API resmi). Akibatnya 1 karakter delimiter (* _ ` [)
+        # di judul grup manapun bisa merusak parsing SEMUA baris setelahnya
+        # (bold hilang, link gagal ter-render, dst — persis kasus yang pernah
+        # terjadi). html.escape() menetralkan &, <, > secara aman dan total,
+        # tidak ada delimiter HTML yang bisa "lolos" dari teks bebas.
         grups = await nexus_get_all_grup()
-        text  = "📂 **GRUP YANG DIAWASI NEXUS AI:**\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        text  = "📂 <b>GRUP YANG DIAWASI NEXUS AI:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        stop_fallback_fetch = False  # set True kalau kena FloodWait — jangan fetch lagi di loop ini
         if grups:
             for idx, g in enumerate(grups, 1):
-                text += f"**{idx}.** 👥 {g['judul']}\n┗─ ID: `{g['chat_id']}`\n"
+                chat_id_g = g["chat_id"]
+                judul     = _html_escape(g["judul"] or str(chat_id_g))
+                username  = g.get("username")
+
+                # Fallback: grup terdaftar SEBELUM field username ada di DB
+                # (data lama) belum punya nilainya tersimpan — username hanya
+                # ter-update saat ada event /spam atau perubahan member admin.
+                # Coba ambil langsung dari Telegram sekali, lalu simpan supaya
+                # render berikutnya tidak perlu fetch ulang.
+                if username is None and not stop_fallback_fetch:
+                    try:
+                        chat = await client.get_chat(chat_id_g)
+                        username = getattr(chat, "username", None)
+                        await nexus_track_grup(chat_id_g, chat.title or g["judul"], username)
+                    except Exception as _fc:
+                        if type(_fc).__name__ == "FloodWait":
+                            # Telegram rate-limit — stop fallback fetch untuk
+                            # sisa grup di loop ini, jangan sampai tombol
+                            # nge-hang menunggu FloodWait demi 1 list.
+                            stop_fallback_fetch = True
+                        # Grup tidak bisa diakses sekarang (privat-tanpa-akses,
+                        # FloodWait, dll) — tampilkan apa adanya untuk siklus ini.
+
+                text += f"<b>{idx}.</b> 👥 {judul}\n┗─ ID: <code>{chat_id_g}</code>\n"
+                if username:
+                    uname_safe = _html_escape(username)
+                    text += f'┗─ 🔗 <a href="https://t.me/{uname_safe}">t.me/{uname_safe}</a>\n'
+                else:
+                    text += "┗─ 🔒 Grup privat (tanpa username publik)\n"
         else:
-            text += "_Belum ada grup yang terdaftar._"
-        await _safe_edit(cq.message, text, _back_main())
+            text += "<i>Belum ada grup yang terdaftar.</i>"
+        await _safe_edit_html(cq.message, text, _back_main())
 
     elif data == "nx_lihat_ai":
         if user_id != OWNER_ID:
@@ -1111,7 +1259,7 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
         except Exception:
             pass
         ai_ct    = await nexus_get_regex_count()
-        owner_ct = await regex_db.count_documents({})
+        owner_ct = await get_owner_regex_count()
         wl_ct    = await nexus_whitelist_count()
         await _safe_edit(
             cq.message,
@@ -1401,7 +1549,7 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
                 pass
             return
         await generate_regex_otomatis_async()
-        me   = await client.get_me()
+        me   = client.me
         text = await _welcome_text()
         await _safe_edit(cq.message, text, _main_markup(me.username))
         try:
@@ -1442,7 +1590,7 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
         except Exception:
             pass
         await nexus_clear_kalimat()
-        me   = await client.get_me()
+        me   = client.me
         text = await _welcome_text()
         await _safe_edit(cq.message, text, _main_markup(me.username))
 
@@ -1458,7 +1606,7 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
         except Exception:
             pass
         await nexus_clear_regex()
-        me   = await client.get_me()
+        me   = client.me
         text = await _welcome_text()
         await _safe_edit(cq.message, text, _main_markup(me.username))
 
