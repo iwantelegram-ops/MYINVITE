@@ -1,3 +1,4 @@
+import asyncio
 """
 plugins/commands/settings.py
 ─────────────────────────────
@@ -14,7 +15,7 @@ DELAY_NOTIF = 10
 
 
 @Client.on_message(
-    filters.command(["setlocal", "setglobal", "setbio", "setwaktu", "status"]) & filters.group
+    filters.command(["setlocal", "setglobal", "setbio", "setwaktu", "status"]) & (filters.group | filters.forum)
 )
 async def group_settings_handler(client: Client, message):
     cid = message.chat.id
@@ -29,41 +30,45 @@ async def group_settings_handler(client: Client, message):
     if cmd == "setlocal":
         if len(message.command) < 2 or message.command[1].lower() not in ["on", "off"]:
             res = await message.reply("⚠️ Format salah. Contoh: <code>/setlocal on</code>", parse_mode=ParseMode.HTML)
-            return await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+            asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
+        return
         val = message.command[1].lower() == "on"
         await update_config(cid, "local", val)
         icon = "🟢" if val else "🔴"
         res  = await message.reply(f"🛡️ Anti-Spam Lokal → {icon} <b>{'ON' if val else 'OFF'}</b>", parse_mode=ParseMode.HTML)
-        await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+        asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
 
     elif cmd == "setglobal":
         if len(message.command) < 2 or message.command[1].lower() not in ["on", "off"]:
             res = await message.reply("⚠️ Format salah. Contoh: <code>/setglobal on</code>", parse_mode=ParseMode.HTML)
-            return await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+            asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
+        return
         val = message.command[1].lower() == "on"
         await update_config(cid, "global", val)
         icon = "🟢" if val else "🔴"
         res  = await message.reply(f"🌐 Anti-Gcast Global → {icon} <b>{'ON' if val else 'OFF'}</b>", parse_mode=ParseMode.HTML)
-        await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+        asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
 
     elif cmd == "setbio":
         if len(message.command) < 2 or message.command[1].lower() not in ["on", "off"]:
             res = await message.reply("⚠️ Format salah. Contoh: <code>/setbio on</code>", parse_mode=ParseMode.HTML)
-            return await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+            asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
+        return
         val = message.command[1].lower() == "on"
         await update_config(cid, "bio_check", val)
         icon = "🟢" if val else "🔴"
         res  = await message.reply(f"🔍 Deteksi Bio Link → {icon} <b>{'ON' if val else 'OFF'}</b>", parse_mode=ParseMode.HTML)
-        await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+        asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
 
     elif cmd == "setwaktu":
         if len(message.command) < 2 or not message.command[1].isdigit():
             res = await message.reply("⚠️ Format salah. Contoh: <code>/setwaktu 15</code>", parse_mode=ParseMode.HTML)
-            return await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+            asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
+        return
         mnt = max(1, int(message.command[1]))
         await update_config(cid, "expiry", mnt * 60)
         res = await message.reply(f"⏱️ Durasi memori spam → <code>{mnt} menit</code>", parse_mode=ParseMode.HTML)
-        await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+        asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
 
     elif cmd == "status":
         def _i(v): return "🟢" if v else "🔴"
@@ -79,4 +84,4 @@ async def group_settings_handler(client: Client, message):
             f"<i>Panel lengkap: /antigcast</i>",
             parse_mode=ParseMode.HTML
         )
-        await auto_delete_reply([res, message], delay=10)
+        asyncio.create_task(auto_delete_reply([res, message], delay=10))

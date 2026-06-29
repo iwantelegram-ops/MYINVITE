@@ -1,3 +1,8 @@
+import asyncio
+import re
+import html
+import unicodedata
+
 """
 plugins/commands/regex_group.py
 ────────────────────────────────
@@ -18,12 +23,11 @@ FORMAT INPUT:
   Semantik | adalah AND (bukan OR) — sama seperti sistem owner spam Nexus.
 """
 
-import re
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 
 from database import db, is_admin, auto_delete_reply
-from core.regex_utils import build_group_interlock, generate_kandidat_mutasi_liar, pipeline_pembersihan
+from core.regex_utils import build_group_interlock
 
 # Alias untuk kompatibilitas file lain yang masih import nama lama
 _build_group_interlock = build_group_interlock
@@ -32,7 +36,7 @@ group_regex_db = db["regex_per_group"]
 DELAY_NOTIF    = 10
 
 
-@Client.on_message(filters.command("addgroupregex") & filters.group)
+@Client.on_message(filters.command("addgroupregex") & (filters.group | filters.forum))
 async def add_group_regex(client: Client, message):
     cid = message.chat.id
     uid = message.from_user.id if message.from_user else None
@@ -54,36 +58,32 @@ async def add_group_regex(client: Client, message):
             "Setiap kata diproses AI mutasi otomatis.",
             parse_mode=ParseMode.HTML
         )
-        return await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+        asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
+        return
 
-    raw_input = " ".join(message.command[1:])
+    # Identik dengan owner: ambil teks setelah command, normalize NFKC dulu
+    raw_input = unicodedata.normalize("NFKC", message.text.split(None, 1)[1].strip())
 
     try:
-        pola, kata_list = build_group_interlock(raw_input)
+        pola, mutasi_display, _ = build_group_interlock(raw_input)
         re.compile(pola)
     except (ValueError, re.error) as e:
         res = await message.reply(
             f"<b>❖ ERROR ❖</b>\n\n"
             f"❌ <b>Input Gagal Diproses!</b>\n"
-            f"◈ <b>Input:</b> <code>{raw_input}</code>\n"
-            f"◈ <b>Keterangan:</b> <code>{e}</code>",
+            f"◈ <b>Input:</b> <code>{html.escape(raw_input)}</code>\n"
+            f"◈ <b>Keterangan:</b> <code>{html.escape(str(e))}</code>",
             parse_mode=ParseMode.HTML
         )
-        return await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+        asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
+        return
 
+    # mutasi_display dari build_group_interlock sudah identik dengan owner:
+    # list[tuple[str, list[str]]] → (kata_lowercase, mutasi_list)
+    # Tidak perlu re-generate manual — mutasi di sini SAMA dengan yang di pola
+    kata_list   = [k for k, _ in mutasi_display]
+    mutasi_map  = {k: m for k, m in mutasi_display}
     raw_display = " | ".join(kata_list) if kata_list else raw_input
-
-    mutasi_map: dict = {}
-    # Pisah kata asli dari raw_input agar kapital owner terjaga
-    kata_asli_list = [k.strip() for k in raw_input.split("|") if k.strip()]
-    for i, kata in enumerate(kata_list):
-        # Ambil versi asli (dengan kapital) jika tersedia
-        kata_dengan_kapital = kata_asli_list[i] if i < len(kata_asli_list) else kata
-        import re as _re4
-        kata_bersih = _re4.sub(r"\(?[×xX]\d+\)?", "", kata_dengan_kapital)
-        kata_bersih = _re4.sub(r"[^\w]", "", kata_bersih).strip()
-        if kata_bersih:
-            mutasi_map[kata] = generate_kandidat_mutasi_liar(kata_bersih)
 
     await group_regex_db.update_one(
         {"chat_id": cid, "pattern": pola},
@@ -104,7 +104,7 @@ async def add_group_regex(client: Client, message):
     except Exception:
         pass
 
-    kata_str = " + ".join(f"<code>{k}</code>" for k in kata_list)
+    kata_str = " + ".join(f"<code>{html.escape(k)}</code>" for k in kata_list)
     res = await message.reply(
         f"<b>❖ FILTER KATA DITAMBAHKAN ❖</b>\n\n"
         f"✅ <b>Filter Khusus Grup Berhasil Tersimpan!</b>\n"
@@ -114,10 +114,10 @@ async def add_group_regex(client: Client, message):
         f"<i>Gunakan /listgroupregex untuk melihat semua filter aktif.</i>",
         parse_mode=ParseMode.HTML
     )
-    await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+    asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
 
 
-@Client.on_message(filters.command("delgroupregex") & filters.group)
+@Client.on_message(filters.command("delgroupregex") & (filters.group | filters.forum))
 async def del_group_regex(client: Client, message):
     cid = message.chat.id
     uid = message.from_user.id if message.from_user else None
@@ -131,18 +131,24 @@ async def del_group_regex(client: Client, message):
             "Gunakan kata yang sama seperti saat menambahkan.",
             parse_mode=ParseMode.HTML
         )
-        return await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+        asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
+        return
 
-    raw_input = " ".join(message.command[1:])
+    # Identik dengan owner: normalize NFKC dulu
+    raw_input      = unicodedata.normalize("NFKC", message.text.split(None, 1)[1].strip())
+    mutasi_display = []
+    result         = None
 
     try:
-        pola, kata_list = build_group_interlock(raw_input)
+        pola, mutasi_display, _ = build_group_interlock(raw_input)
         result = await group_regex_db.delete_one({"chat_id": cid, "pattern": pola})
     except (ValueError, re.error):
-        result = None
+        pass
 
     if not result or not result.deleted_count:
-        raw_display = raw_input.strip()
+        # Fallback: cari by raw display (kata_list joined)
+        kata_list   = [k for k, _ in mutasi_display] if mutasi_display else []
+        raw_display = " | ".join(kata_list) if kata_list else raw_input.strip()
         result = await group_regex_db.delete_one({"chat_id": cid, "raw": raw_display})
 
     if result and result.deleted_count:
@@ -153,7 +159,7 @@ async def del_group_regex(client: Client, message):
             pass
         res = await message.reply(
             f"🗑️ <b>Filter Grup Berhasil Dihapus!</b>\n"
-            f"◈ <b>Kata:</b> <code>{raw_input}</code>",
+            f"◈ <b>Kata:</b> <code>{html.escape(raw_input)}</code>",
             parse_mode=ParseMode.HTML
         )
     else:
@@ -162,10 +168,10 @@ async def del_group_regex(client: Client, message):
             "Gunakan /listgroupregex untuk melihat daftar yang aktif.",
             parse_mode=ParseMode.HTML
         )
-    await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+    asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
 
 
-@Client.on_message(filters.command("listgroupregex") & filters.group)
+@Client.on_message(filters.command("listgroupregex") & (filters.group | filters.forum))
 async def list_group_regex(client: Client, message):
     cid = message.chat.id
     uid = message.from_user.id if message.from_user else None
@@ -175,7 +181,7 @@ async def list_group_regex(client: Client, message):
     docs = [doc async for doc in group_regex_db.find({"chat_id": cid})]
 
     if docs:
-        lines = "\n".join(f"  ◈ <b>{doc.get('raw', '—')}</b>" for doc in docs)
+        lines = "\n".join(f"  ◈ <b>{html.escape(str(doc.get('raw', '—')))}</b>" for doc in docs)
         text  = (
             "<b>❖ FILTER KATA GRUP ❖</b>\n"
             f"⚡ <b>Total Aktif:</b> <code>{len(docs)} Pola</code>\n\n"
@@ -192,4 +198,4 @@ async def list_group_regex(client: Client, message):
         )
 
     res = await message.reply(text, parse_mode=ParseMode.HTML)
-    await auto_delete_reply([res, message], delay=30)
+    asyncio.create_task(auto_delete_reply([res, message], delay=30))
