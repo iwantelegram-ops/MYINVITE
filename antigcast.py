@@ -21,6 +21,12 @@ import threading
 from pathlib import Path as _Path
 import dns.resolver
 from pyrogram import Client, idle
+from pyrogram import filters
+
+# BYPASS UNTUK JALUR RAILWAY AGAR TIDAK ATTRIBUTE ERROR
+if not hasattr(filters, "forum"):
+    # Jika .forum tidak ada, arahkan otomatis ke .topics atau pasang filter kustom
+    filters.forum = getattr(filters, "topics", getattr(filters, "forum_topic", filters.group))
 from pyrogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -32,7 +38,18 @@ _BOT_DIR = _Path(__file__).resolve().parent
 if str(_BOT_DIR) not in sys.path:
     sys.path.insert(0, str(_BOT_DIR))
 
-from database import setup_db, delete_worker, close_db, get_bot_config, save_bot_config, get_active_backend
+# ── Folder security_os/ ────────────────────────────────────────────────────────
+# video_call.py, monitor_bot_reference.py, dan admin_session.py dipindah ke
+# subfolder security_os/ agar tidak bercampur dengan file utama di root proyek.
+# Ditambahkan ke sys.path (bukan diimpor sebagai package security_os.xxx) supaya
+# SEMUA import lama yang sudah ada di seluruh proyek — `from video_call import
+# ...`, `import admin_session as ...`, `from monitor_bot_reference import ...`
+# — tetap berfungsi tanpa perlu diubah satu per satu di setiap file plugin.
+_SECURITY_OS_DIR = _BOT_DIR / "security_os"
+if str(_SECURITY_OS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SECURITY_OS_DIR))
+
+from database import setup_db, delete_worker, panel_write_worker, close_db, get_bot_config, save_bot_config, get_active_backend, upsert_known_peer, get_all_known_peers, ensure_known_peers_index, ensure_mention_global_index
 from admin_session import start_cleanup_task as _adm_cleanup
 from video_call import start_userbot, stop_userbot
 
@@ -48,6 +65,13 @@ API_ID    = int(os.environ.get("API_ID", 0))
 API_HASH  = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CODE_BOT  = os.environ.get("CODE_BOT", "").strip()
+
+# Set "1"/"true" di .env (REWARM_USER_ENABLED) jika suatu saat fitur DM ke user
+# dari dm_users_db atau group_action_log_db benar-benar dibutuhkan kembali.
+# Default off (0) karena saat ini tidak ada fitur yang mengirim DM ke user
+# dari kedua sumber tersebut — rewarm user hanya membuang panggilan get_users()
+# tanpa manfaat, dan jumlah gagal akan terus naik mengikuti jumlah entri di DB.
+REWARM_USER_ENABLED = os.environ.get("REWARM_USER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
 
 # ── Session name — berbasis CODE_BOT jika tersedia, fallback ke bot_id ────────
 # Jika CODE_BOT diset:
@@ -207,6 +231,55 @@ async def _periodic_session_backup() -> None:
         await _save_session_to_mongo()
         print("[Session] 🔄 Periodic backup session selesai.")
 
+# ── Passive Peer Collector ────────────────────────────────────────────────────
+# Setiap pesan yang masuk ke grup otomatis menyertakan data user lengkap
+# dari Pyrogram — termasuk access_hash. Kita simpan ke MongoDB known_peers
+# agar saat redeploy berikutnya bisa warm peer dengan access_hash yang valid.
+
+from pyrogram import Client as _PClient, filters as _pfilters
+from pyrogram.handlers import MessageHandler as _MsgHandler
+from pyrogram.types import Message as _Msg
+
+async def _peer_collector_handler(client, message: _Msg) -> None:
+    """
+    Handler pasif — tidak memblokir, tidak reply. Hanya simpan peer.
+
+    access_hash tidak tersedia di high-level message.from_user pada bot.
+    Cara yang benar: panggil resolve_peer() saat bot sudah "melihat" user
+    dari update ini — Pyrogram menyimpan access_hash ke session cache saat
+    itu juga. Lalu baca dari raw result.
+    """
+    try:
+        user = message.from_user
+        if not user or user.is_bot:
+            return
+        uid = user.id
+
+        # resolve_peer() berhasil karena bot baru saja terima update dari user ini
+        from pyrogram import raw as _raw
+        peer = await client.resolve_peer(uid)
+        if not hasattr(peer, "access_hash"):
+            return
+        access_hash = peer.access_hash
+        if not access_hash:
+            return
+
+        asyncio.create_task(
+            upsert_known_peer(uid, access_hash, user.first_name or "")
+        )
+    except Exception:
+        pass  # Jangan crash — ini hanya collector pasif
+
+def register_peer_collector(app) -> None:
+    """
+    Daftarkan handler pasif ke instance Client.
+    Dipanggil setelah app.start() — sebelum idle().
+    Group=-1 agar jalan sebelum handler lain, tapi tidak pernah stop propagation.
+    """
+    app.add_handler(_MsgHandler(_peer_collector_handler, _pfilters.group), group=-1)
+    print("[PeerCollector] ✅ Handler pasif aktif — setiap pesan grup akan simpan peer.")
+
+
 # ── Deploy Handshake via MongoDB ──────────────────────────────────────────────
 # Masalah: Railway start instance baru SEBELUM instance lama benar-benar mati.
 # Dua koneksi aktif ke Telegram → AuthKeyDuplicated → session invalid.
@@ -220,7 +293,25 @@ async def _periodic_session_backup() -> None:
 #   "active"   → instance baru sudah running (tulis setelah app.start())
 
 _DEPLOY_FLAG_KEY = f"deploy_{_SESSION_SUFFIX}"
-_DEPLOY_ID       = str(os.getpid())  # unik per proses
+
+# FIX (bug: session userbot tidak tersimpan saat redeploy): _DEPLOY_ID
+# SEBELUMNYA hanya str(os.getpid()). Di container Docker/Railway, proses
+# pertama yang dijalankan di dalam container baru hampir selalu mendapat
+# PID 1 (PID namespace baru per container). Akibatnya deploy LAMA dan
+# deploy BARU bisa punya _DEPLOY_ID yang SAMA PERSIS ("1"). Pengecekan
+# `data.get("by") != _DEPLOY_ID` di _deploy_watch_and_release() jadi
+# False terus — instance lama menyangka sinyal "pending" itu datang dari
+# dirinya sendiri, sehingga graceful_shutdown() (yang menyimpan session
+# userbot via stop_userbot()) TIDAK PERNAH terpanggil lewat jalur ini.
+# Satu-satunya jalur penyelamat tersisa adalah SIGTERM, yang tidak selalu
+# sempat selesai sebelum Railway mengirim SIGKILL.
+#
+# Solusi: _DEPLOY_ID sekarang gabungan PID + waktu proses dimulai + token
+# acak — kombinasi ini praktis mustahil sama antara dua proses berbeda,
+# bahkan jika kebetulan keduanya mendapat PID yang sama.
+import time as _time_deploy_id
+import uuid as _uuid_deploy_id
+_DEPLOY_ID = f"{os.getpid()}-{int(_time_deploy_id.time())}-{_uuid_deploy_id.uuid4().hex[:8]}"
 
 
 async def _deploy_signal_new() -> None:
@@ -256,7 +347,7 @@ async def _deploy_signal_new() -> None:
     # ── Ada instance aktif → sinyal dan tunggu ───────────────────────────────
     payload = json.dumps({"state": "pending", "by": _DEPLOY_ID, "ts": time.time()})
     await save_bot_config(_DEPLOY_FLAG_KEY, payload)
-    print(f"[Deploy] 🆕 Instance aktif ditemukan. Flag 'pending' ditulis (pid={_DEPLOY_ID}). "
+    print(f"[Deploy] 🆕 Instance aktif ditemukan. Flag 'pending' ditulis (deploy_id={_DEPLOY_ID}). "
           f"Tunggu instance lama release (maks 30 detik)...")
 
     deadline = asyncio.get_event_loop().time() + 30
@@ -280,9 +371,19 @@ async def _deploy_signal_new() -> None:
 async def _deploy_watch_and_release() -> None:
     """
     Instance LAMA: poll MongoDB setiap 2 detik. Jika ada flag 'pending' dari
-    deploy baru (bukan dari diri sendiri), lakukan graceful_shutdown() lalu
-    tulis flag 'released' agar instance baru bisa lanjut.
+    deploy baru (bukan dari diri sendiri), HANYA update session ke MongoDB
+    lalu tulis flag 'released' agar instance baru bisa lanjut start.
+    Instance lama TIDAK shutdown — Railway yang akan kill prosesnya via SIGTERM.
     Berjalan sebagai background task sejak awal.
+
+    Kenapa tidak shutdown di sini:
+      Jika instance lama langsung shutdown + loop.stop() saat flag 'pending'
+      terdeteksi, ada race condition — flag 'released' sudah ditulis tapi
+      _save_session_to_mongo() belum tentu selesai saat instance baru sudah
+      ambil alih koneksi Telegram. Session jadi tidak tersimpan sempurna.
+      Dengan membiarkan instance lama tetap jalan, Railway yang kill pada
+      waktunya via SIGTERM — dan saat itu graceful_shutdown() via SIGTERM
+      handler yang menangani save session dengan benar.
     """
     if get_active_backend() != "mongo":
         return
@@ -301,11 +402,17 @@ async def _deploy_watch_and_release() -> None:
 
         # Ada permintaan deploy baru, bukan dari diri sendiri
         if data.get("state") == "pending" and data.get("by") != _DEPLOY_ID:
-            print(f"[Deploy] 🔄 Deploy baru terdeteksi. Instance lama mulai shutdown...")
-            globals()["_shutdown_triggered"] = True
+            print(f"[Deploy] 🔄 Deploy baru terdeteksi. Update session ke MongoDB (tanpa shutdown)...")
 
-            # Simpan flag 'released' SEBELUM shutdown penuh agar instance baru
-            # tidak menunggu sampai timeout 30 detik
+            # Save session dulu — pastikan peer cache terbaru tersimpan
+            try:
+                await _save_session_to_mongo()
+                from monitor_bot_reference import save_all_sessions
+                await save_all_sessions()
+            except Exception as e:
+                print(f"[Deploy] ⚠️  Gagal update session sebelum release: {e}")
+
+            # Tulis flag 'released' agar instance baru tidak menunggu timeout 30 detik
             import time
             released = json.dumps({"state": "released", "by": _DEPLOY_ID, "ts": time.time()})
             try:
@@ -313,10 +420,10 @@ async def _deploy_watch_and_release() -> None:
             except Exception:
                 pass
 
-            await graceful_shutdown()
-            # Hentikan event loop — instance ini selesai
-            asyncio.get_event_loop().stop()
-            return
+            print(f"[Deploy] ✅ Session sudah diupdate & flag 'released' ditulis. "
+                  f"Instance lama TETAP berjalan hingga Railway kill via SIGTERM.")
+            # Tidak shutdown, tidak stop loop — lanjut polling seperti biasa
+            continue
 
 
 async def _deploy_mark_active() -> None:
@@ -326,7 +433,7 @@ async def _deploy_mark_active() -> None:
     import json, time
     payload = json.dumps({"state": "active", "by": _DEPLOY_ID, "ts": time.time()})
     await save_bot_config(_DEPLOY_FLAG_KEY, payload)
-    print(f"[Deploy] ✅ Flag 'active' ditulis (pid={_DEPLOY_ID}).")
+    print(f"[Deploy] ✅ Flag 'active' ditulis (deploy_id={_DEPLOY_ID}).")
 
 
 async def _rewarm_known_peers(client) -> None:
@@ -384,27 +491,36 @@ async def _rewarm_known_peers(client) -> None:
             _ch_id = int(os.environ.get(_env_key, 0))
             if _ch_id:
                 peer_ids.add(_ch_id)
+                # Baca username yang disimpan saat startup sebelumnya
+                from database import get_bot_config as _gcfg
+                _uname = await _gcfg(f"{_env_key.lower()}_username")
+                if _uname and _ch_id not in username_map:
+                    username_map[_ch_id] = f"@{_uname.lstrip('@')}"
         except Exception:
             pass
 
-    # User dari dm_users
-    try:
-        from database import get_all_dm_users
-        dm_users = await get_all_dm_users()
-        for uid in dm_users:
-            if uid:
-                user_ids.add(int(uid))
-    except Exception as e:
-        print(f"[Rewarm] ⚠️  Gagal baca dm_users_db: {e}")
+    # User dari dm_users + group_action_log — DINONAKTIFKAN secara default (lihat
+    # REWARM_USER_ENABLED di atas). Pengumpulan user_ids dilewati sepenuhnya
+    # agar tidak ada kerja sia-sia membaca koleksi ini setiap startup.
+    if REWARM_USER_ENABLED:
+        # User dari dm_users
+        try:
+            from database import get_all_dm_users
+            dm_users = await get_all_dm_users()
+            for uid in dm_users:
+                if uid:
+                    user_ids.add(int(uid))
+        except Exception as e:
+            print(f"[Rewarm] ⚠️  Gagal baca dm_users_db: {e}")
 
-    # User dari group_action_log
-    try:
-        async for doc in group_action_log_db.find({}):
-            uid = doc.get("user_id")
-            if uid:
-                user_ids.add(int(uid))
-    except Exception as e:
-        print(f"[Rewarm] ⚠️  Gagal baca group_action_log_db: {e}")
+        # User dari group_action_log
+        try:
+            async for doc in group_action_log_db.find({}):
+                uid = doc.get("user_id")
+                if uid:
+                    user_ids.add(int(uid))
+        except Exception as e:
+            print(f"[Rewarm] ⚠️  Gagal baca group_action_log_db: {e}")
     
     # Resolve grup/channel — prioritas @username (tidak butuh access hash di sesi baru),
     # fallback ke integer ID (butuh access hash; mungkin gagal di sesi baru).
@@ -429,20 +545,37 @@ async def _rewarm_known_peers(client) -> None:
         await asyncio.sleep(0.3)  # jeda kecil cegah rate-limit
     print(f"[Rewarm] ✅ Chat: {ok} berhasil, {fail} gagal ({len(peer_ids)} total)")
 
-    # Resolve user — SATU PER SATU (bukan batch).
-    # Alasan: get_users([id1, id2, ...]) akan throw exception dan menggagalkan
-    # SELURUH batch jika ada satu user_id yang tidak dikenal di sesi ini.
-    # Dengan loop per-user, user yang valid tetap ter-resolve meski ada yang gagal.
-    user_list = list(user_ids)
-    u_ok, u_fail = 0, 0
-    for uid in user_list:
-        try:
-            await client.get_users(uid)
-            u_ok += 1
-        except Exception:
-            u_fail += 1
-        await asyncio.sleep(0.3)  # jeda kecil cegah rate-limit
-    print(f"[Rewarm] ✅ User: {u_ok} berhasil, {u_fail} gagal ({len(user_list)} total)")
+    # ── Rewarm user pakai known_peers MongoDB ────────────────────────────────
+    # Strategi lama (get_users(integer_id)) selalu gagal di sesi baru karena
+    # tidak punya access_hash. Strategi baru: baca access_hash yang sudah
+    # dikumpulkan pasif dari setiap pesan masuk, lalu warm pakai
+    # raw.types.InputUser(user_id, access_hash) yang pasti valid.
+    async def _rewarm_users_bg():
+        peers = await get_all_known_peers()
+        if not peers:
+            print("[Rewarm] ℹ️  known_peers kosong — belum ada peer tersimpan.")
+            return
+
+        from pyrogram import raw
+        u_ok, u_fail = 0, 0
+        for p in peers:
+            uid         = p["_id"]
+            access_hash = p.get("access_hash", 0)
+            try:
+                # InputUser dengan access_hash yang valid — tidak butuh session cache
+                await client.invoke(
+                    raw.functions.users.GetUsers(
+                        id=[raw.types.InputUser(user_id=uid, access_hash=access_hash)]
+                    )
+                )
+                u_ok += 1
+            except Exception:
+                u_fail += 1
+            await asyncio.sleep(0.1)  # lebih cepat dari sebelumnya — access_hash valid
+
+        print(f"[Rewarm] ✅ User: {u_ok} berhasil, {u_fail} gagal ({len(peers)} total peer)")
+
+    asyncio.create_task(_rewarm_users_bg())
 
 # ── Health Check ──────────────────────────────────────────────────────────────
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -469,15 +602,15 @@ async def _setup_commands():
     try:
         await app.set_bot_commands(
             commands=[
-                BotCommand("unmutemic", "hps / priv link bio sebelum klik ini"),
+                BotCommand("unmutemic", "hps/priv link bio dlu"),
                 BotCommand("antigcast", "anti spam cerdas abad ini"),
-                BotCommand("spam", "balas pesan n masukin ke database AI"),
+                BotCommand("govip", "cara jadi vip member"),
             ],
             scope=BotCommandScopeAllGroupChats(),
         )
         await app.set_bot_commands(
             commands=[
-                BotCommand("antigcast", "anti spam cerdas"),
+                BotCommand("start", "anti spam cerdas"),
             ],
             scope=BotCommandScopeAllPrivateChats(),
         )
@@ -489,46 +622,119 @@ async def _setup_commands():
 # ── Resolve Channel Peer ──────────────────────────────────────────────────────
 async def _resolve_channel_peer(client):
     """
-    Resolve CHANNEL_OWNER, LOG_CHANNEL, dan LOG_OS dari .env ke Telegram peer,
-    lalu simpan info CHANNEL_OWNER (title + username) ke database cloud.
+    Resolve CHANNEL_OWNER, LOG_CHANNEL, dan LOG_OS dari .env ke Telegram peer.
 
-    Tujuan:
-      • Sesi baru belum pernah "melihat" channel → PeerIdInvalid saat kirim log
-      • Resolve di sini memaksa Telegram mengembalikan access hash → masuk peer cache
-      • Username di DB memungkinkan resolve ulang via @username saat bot restart
+    Strategi resolve per channel (urutan prioritas):
+      1. Integer ID langsung — berhasil jika access hash sudah ada di session
+      2. Invite link dari DB  — berhasil di sesi baru tanpa access hash
+      3. Generate invite link baru via export_chat_invite_link() — butuh bot
+         sudah jadi admin dengan izin "Invite Users", lalu simpan ke DB
+
+    Invite link disimpan permanen di DB dan dipakai ulang setiap restart.
+    Hanya di-generate ulang jika channel_id di env berubah (db_key berisi
+    channel_id yang mana invite link itu milik — deteksi otomatis).
 
     Dipanggil sekali setelah app.start() di main().
     """
-    from database import save_bot_config
+    from database import save_bot_config, get_bot_config
 
-    # ── Resolve LOG_CHANNEL dan LOG_OS ────────────────────────────────────────────
-    # Cukup get_chat() — tujuannya hanya agar access hash masuk peer cache session.
-    for _env_key in ("LOG_CHANNEL", "LOG_OS"):
+    async def _resolve_one(env_key: str, ch_id: int) -> "object | None":
+        """
+        Resolve satu channel. Return Chat object jika berhasil, None jika gagal.
+        Side-effect: simpan/update invite link dan info channel ke DB.
+        """
+        db_key_link    = f"{env_key.lower()}_invite_link"
+        db_key_link_id = f"{env_key.lower()}_invite_link_for_id"  # channel_id pemilik link
+
+        # ── 1. Coba integer ID langsung ──────────────────────────────────────
+        try:
+            ch = await client.get_chat(ch_id)
+            print(f"[Startup] ✅ {env_key} ({ch_id}) di-resolve via integer ID.")
+            return ch
+        except Exception:
+            pass
+
+        # ── 1b. Coba @username dari DB ───────────────────────────────────────
+        # Sesi baru setelah redeploy sering gagal resolve integer ID channel
+        # karena access hash belum ada. @username tidak butuh access hash,
+        # jadi ini jalur paling andal untuk LOG_CHANNEL dan LOG_OS.
+        try:
+            _saved_uname = await get_bot_config(f"{env_key.lower()}_username")
+            if _saved_uname:
+                ch = await client.get_chat(f"@{_saved_uname.lstrip('@')}")
+                print(f"[Startup] ✅ {env_key} ({ch_id}) di-resolve via @username dari DB.")
+                return ch
+        except Exception:
+            pass
+
+        # ── 2. Coba invite link dari DB ──────────────────────────────────────
+        saved_link    = await get_bot_config(db_key_link)
+        saved_link_id = await get_bot_config(db_key_link_id)
+
+        # Invalidasi link lama jika channel_id di env sudah berubah
+        if saved_link and saved_link_id and int(saved_link_id) != ch_id:
+            print(
+                f"[Startup] ℹ️  {env_key}: channel_id berubah "
+                f"({saved_link_id} → {ch_id}), invite link lama diabaikan."
+            )
+            saved_link = None
+
+        if saved_link:
+            try:
+                ch = await client.get_chat(saved_link)
+                print(f"[Startup] ✅ {env_key} ({ch_id}) di-resolve via invite link dari DB.")
+                return ch
+            except Exception as _e:
+                print(f"[Startup] ⚠️  {env_key}: invite link dari DB gagal ({_e}), coba generate baru.")
+
+        # ── 3. Generate invite link baru ─────────────────────────────────────
+        # Butuh bot sudah jadi admin dengan izin "Invite Users" di channel.
+        try:
+            link = await client.export_chat_invite_link(ch_id)
+            if link:
+                await save_bot_config(db_key_link,    link)
+                await save_bot_config(db_key_link_id, str(ch_id))
+                ch = await client.get_chat(link)
+                print(
+                    f"[Startup] ✅ {env_key} ({ch_id}) di-resolve via invite link baru "
+                    f"(disimpan ke DB)."
+                )
+                return ch
+        except Exception as _e2:
+            print(
+                f"[Startup] ⚠️  {env_key} ({ch_id}): semua metode resolve gagal. "
+                f"Pastikan bot admin dengan izin 'Invite Users'. Error: {_e2}"
+            )
+        return None
+
+    # ── Resolve ketiga channel ────────────────────────────────────────────────
+    for _env_key in ("LOG_CHANNEL", "LOG_OS", "CHANNEL_OWNER"):
         try:
             _ch_id = int(os.environ.get(_env_key, 0))
             if not _ch_id:
                 continue
-            await client.get_chat(_ch_id)
-            print(f"[Startup] ✅ {_env_key} ({_ch_id}) berhasil di-resolve ke peer cache.")
-        except Exception as _e:
-            print(f"[Startup] ⚠️  Gagal resolve {_env_key}: {_e}")
+            ch = await _resolve_one(_env_key, _ch_id)
+            if ch is None:
+                continue
 
-    # ── Resolve CHANNEL_OWNER + simpan title/username ke DB ────────────────────
-    ch_id = int(os.environ.get("CHANNEL_OWNER", 0))
-    if not ch_id:
-        return
-    try:
-        ch = await client.get_chat(ch_id)
-        title    = ch.title or ""
-        username = getattr(ch, "username", None) or ""
-        await save_bot_config("channel_owner_id",       ch_id)
-        await save_bot_config("channel_owner_title",    title)
-        await save_bot_config("channel_owner_username", username)
-        label = f"@{username}" if username else f"(no username, id={ch_id})"
-        print(f"[Startup] ✅ CHANNEL_OWNER '{title}' {label} berhasil di-cache ke DB.")
-    except Exception as e:
-        print(f"[Startup] ⚠️  Gagal resolve CHANNEL_OWNER ({ch_id}): {e}")
-        print(f"           Info channel akan diambil dari cache DB (jika sudah pernah disimpan sebelumnya).")
+            # Simpan info channel ke DB (dipakai rewarm & tampilan /start)
+            _title    = getattr(ch, "title", "") or ""
+            _username = getattr(ch, "username", None) or ""
+            await save_bot_config(f"{_env_key.lower()}_id",    _ch_id)
+            await save_bot_config(f"{_env_key.lower()}_title",  _title)
+            if _username:
+                await save_bot_config(f"{_env_key.lower()}_username", _username)
+
+            # Kompatibilitas mundur: CHANNEL_OWNER masih simpan key lama juga
+            if _env_key == "CHANNEL_OWNER":
+                await save_bot_config("channel_owner_id",       _ch_id)
+                await save_bot_config("channel_owner_title",    _title)
+                await save_bot_config("channel_owner_username", _username)
+                label = f"@{_username}" if _username else f"(no username, id={_ch_id})"
+                print(f"[Startup] ✅ CHANNEL_OWNER '{_title}' {label} berhasil di-cache ke DB.")
+
+        except Exception as _outer_e:
+            print(f"[Startup] ⚠️  {_env_key}: error tak terduga: {_outer_e}")
 
 
 # ── Graceful Shutdown ─────────────────────────────────────────────────────────
@@ -591,6 +797,39 @@ async def graceful_shutdown():
     except Exception as e:
         print(f"[Shutdown] ⚠️  Gagal simpan session monitor: {e}")
 
+    # FIX (bug: sesi userbot lama tidak terbaca saat redeploy): backup juga
+    # session userbot (Security OS) ke MongoDB. Sebelumnya graceful_shutdown()
+    # (dipanggil dari SIGTERM handler — jalur redeploy Railway yang sebenarnya)
+    # tidak pernah menyentuh session userbot sama sekali; stop_userbot() hanya
+    # dipanggil di finally block main(), yang TIDAK TENTU tereksekusi saat
+    # proses dimatikan paksa lewat SIGTERM. Tanpa baris ini, peer cache userbot
+    # (termasuk login yang baru saja berhasil) hilang setiap redeploy.
+    try:
+        from video_call import stop_userbot as _stop_ub
+        await _stop_ub()
+    except Exception as e:
+        print(f"[Shutdown] ⚠️  Gagal simpan/stop session userbot: {e}")
+
+    # Bengkel (mode lama, standalone): putus semua koneksi token backup.
+    # Tidak ada session penting yang perlu dibackup di sini — token backup
+    # tidak menyimpan peer cache grup manapun (stateless, hanya dipakai
+    # sesaat untuk GetFullUser).
+    try:
+        from core.workshop_pool import workshop_pool
+        await workshop_pool.stop_all()
+    except Exception as e:
+        print(f"[Shutdown] ⚠️  Gagal stop Bengkel: {e}")
+
+    # Bengkel Join Pool (mode baru): BERBEDA dari di atas — Bengkel di sini
+    # mungkin sedang JADI MEMBER di suatu grup. stop_all() akan leave_chat()
+    # dengan rapi dulu sebelum disconnect, supaya tidak ada Bengkel yang
+    # "nyangkut" sebagai member grup setelah proses berhenti/redeploy.
+    try:
+        from core.workshop_join_pool import workshop_join_pool
+        await workshop_join_pool.stop_all()
+    except Exception as e:
+        print(f"[Shutdown] ⚠️  Gagal stop Bengkel Join: {e}")
+
     await _notify_owner()
 
     current = asyncio.current_task()
@@ -628,6 +867,18 @@ async def main():
 
     # Setup database (auto-pilih MongoDB atau SQLite)
     await setup_db()
+
+    # ── Bengkel: login semua token backup GetFullUser di background ─────────
+    # TIDAK di-await — login N token backup tidak boleh menunda app.start()
+    # bot utama. Kalau Bengkel belum siap saat request pertama datang,
+    # check_and_save() akan lazy-start sendiri (lihat workshop_pool.py).
+    try:
+        from core.workshop_pool import workshop_pool
+        if workshop_pool.size > 0:
+            asyncio.create_task(workshop_pool.start_all())
+            print(f"[Workshop] 🔧 {workshop_pool.size} token backup terdeteksi, login di background...")
+    except Exception as e:
+        print(f"[Workshop] Gagal inisialisasi pool: {e}")
 
     # ── Deploy Handshake ──────────────────────────────────────────────────────
     # Sinyal ke instance lama bahwa deploy baru siap — tunggu sampai instance lama
@@ -678,27 +929,214 @@ async def main():
     # sudah terkoneksi saat worker pertama kali mencoba menghapus pesan.
     asyncio.create_task(delete_worker(app))
 
+    # ── Bengkel Join Pool: bot bengkel yang bisa masuk/keluar grup ───────────
+    # Login token backup (sama dengan workshop_pool di atas, tapi role
+    # berbeda — masuk grup sebagai member, bukan standalone) DAN bootstrap
+    # resolvability ke bot utama (kirim 1x DM). Harus setelah app.start()
+    # karena perlu app.get_me() (untuk DM bootstrap) dan nanti
+    # add_chat_members() butuh app yang sudah terkoneksi.
+    try:
+        from core.workshop_join_pool import workshop_join_pool
+        if workshop_join_pool.size > 0:
+            asyncio.create_task(workshop_join_pool.start_all(app))
+            print(f"[BengkelJoin] 🔧 {workshop_join_pool.size} Bengkel join terdeteksi, login + bootstrap di background...")
+    except Exception as e:
+        print(f"[BengkelJoin] Gagal inisialisasi pool: {e}")
+
+    # Background task moderation_worker_loop — eksekusi mute/unmute/ban satu
+    # per satu dengan jeda kecil antar aksi, agar tidak ada banyak aksi
+    # moderasi ditembak bersamaan ke Telegram API saat raid terjadi.
+    from core.moderation_queue import moderation_worker_loop
+    asyncio.create_task(moderation_worker_loop(app))
+
+    # Background task panel_write_worker — menulis ke DB hasil tombol panel
+    # (toggle, +/-, dsb) secara antri. Client diteruskan agar worker bisa
+    # mengoreksi tampilan panel di DM admin jika penulisan gagal permanen.
+    asyncio.create_task(panel_write_worker(app))
+
     try:
         # Tandai instance ini sebagai aktif di MongoDB
-        await _deploy_mark_active()
+        try:
+            await _deploy_mark_active()
+        except Exception as e:
+            print(f"[Startup] ⚠️  _deploy_mark_active gagal (dilanjutkan): {e}")
+
         # Simpan session lokal ke MongoDB setelah login berhasil
-        await _save_session_to_mongo()
-        await _setup_commands()
+        try:
+            await _save_session_to_mongo()
+        except Exception as e:
+            print(f"[Startup] ⚠️  _save_session_to_mongo gagal (dilanjutkan): {e}")
+
+        try:
+            await _setup_commands()
+        except Exception as e:
+            print(f"[Startup] ⚠️  _setup_commands gagal (dilanjutkan): {e}")
+
         # Resolve CHANNEL_OWNER peer → simpan ke DB agar dikenal sesi baru
-        await _resolve_channel_peer(app)
+        try:
+            await _resolve_channel_peer(app)
+        except Exception as e:
+            print(f"[Startup] ⚠️  _resolve_channel_peer gagal (dilanjutkan): {e}")
+
+        # Daftarkan handler pasif untuk kumpulkan access_hash setiap pesan masuk
+        # → data ini dipakai saat rewarm user setelah redeploy berikutnya
+        try:
+            register_peer_collector(app)
+        except Exception as e:
+            print(f"[Startup] ⚠️  register_peer_collector gagal (dilanjutkan): {e}")
+
+        # Pastikan index TTL known_peers ada
+        try:
+            await ensure_known_peers_index()
+        except Exception as e:
+            print(f"[Startup] ⚠️  ensure_known_peers_index gagal (dilanjutkan): {e}")
+
+        # Pastikan index mention_global_cache ada
+        try:
+            await ensure_mention_global_index()
+        except Exception as e:
+            print(f"[Startup] ⚠️  ensure_mention_global_index gagal (dilanjutkan): {e}")
+
         # Isi ulang peer cache dari semua grup/channel yang dikenal di DB
         # → mencegah PeerIdInvalid setelah Railway redeploy (filesystem bersih)
-        await _rewarm_known_peers(app)
+        try:
+            await _rewarm_known_peers(app)
+        except Exception as e:
+            print(f"[Startup] ⚠️  _rewarm_known_peers gagal (dilanjutkan): {e}")
+
         # Backup session ke MongoDB setiap 20 menit
         # → peer baru yang ditemui saat bot berjalan ikut tersimpan
-        asyncio.create_task(_periodic_session_backup())
+        try:
+            asyncio.create_task(_periodic_session_backup())
+        except Exception as e:
+            print(f"[Startup] ⚠️  Gagal create_task _periodic_session_backup: {e}")
 
         # ── Userbot Security OS ───────────────────────────────────────────────
         # Dijalankan SETELAH bot biasa start & siap agar OTP bisa dikirim ke owner.
         # start_userbot tidak blocking — ia menjalankan task sendiri di background.
-        asyncio.create_task(start_userbot(app))
+        #
+        # FIX (disederhanakan kembali ke pola versi lama yang terbukti selalu
+        # bekerja): sebelumnya ada wrapper _run_start_userbot_safely() di sekitar
+        # create_task ini. Wrapper itu seharusnya setara secara fungsional, tapi
+        # untuk menyingkirkan kemungkinan ada interaksi tak terduga, baris ini
+        # dikembalikan ke bentuk paling sederhana — create_task langsung pada
+        # start_userbot(app), identik dengan versi yang sudah terbukti membuat
+        # userbot selalu aktif sebelumnya. start_userbot() sendiri SUDAH
+        # membungkus setiap langkah internalnya dengan try/except masing-masing
+        # (lihat video_call.py) sehingga tidak butuh wrapper tambahan di sini.
+        #
+        # Print log EKSPLISIT ditambahkan tepat sebelum & sesudah create_task
+        # ini — jika suatu saat baris "[UB] ▶️" di video_call.py tidak pernah
+        # muncul di log lagi, baris print di bawah ini akan menunjukkan dengan
+        # pasti apakah create_task ini sendiri tercapai atau tidak.
+        print("[Startup] ▶️  Memanggil create_task(start_userbot)...", flush=True)
+        try:
+            asyncio.create_task(start_userbot(app))
+            print("[Startup] ✅ create_task(start_userbot) berhasil dijadwalkan.", flush=True)
+        except Exception as e:
+            import traceback
+            print(f"[UB] ❌ Gagal create_task start_userbot: {e}", flush=True)
+            traceback.print_exc()
 
-        print("🚀 Bot Antispam + Nexus AI aktif! Tekan Ctrl+C untuk berhenti.")
+        # ── NewsCore Time-Checker Loop ────────────────────────────────────────
+        try:
+            from plugins.commands.newscore import newscore_checker_loop
+            asyncio.create_task(newscore_checker_loop(app))
+        except Exception as e:
+            print(f"[Startup] ⚠️  newscore_checker_loop gagal dimulai: {e}")
+
+        # ── NewsCore Bio Admin Sweep Loop (inspeksi berkala jam 03:00 WIB) ────
+        try:
+            from plugins.commands.newscore import newscore_bio_sweep_loop
+            asyncio.create_task(newscore_bio_sweep_loop(app))
+        except Exception as e:
+            print(f"[Startup] ⚠️  newscore_bio_sweep_loop gagal dimulai: {e}")
+
+        # ── VIP Bio Checker Loop (auto-keluar VIP saat teks hilang dari bio) ──
+        try:
+            from core.vip_bio_guard import vip_bio_checker_loop
+            asyncio.create_task(vip_bio_checker_loop())
+        except Exception as e:
+            print(f"[Startup] ⚠️  vip_bio_checker_loop gagal dimulai: {e}")
+
+        # ── NewsCore Score Buffer Flush Worker ────────────────────────────────
+        # Flush skor yang di-buffer di memory ke MongoDB secara batch,
+        # setiap NS_FLUSH_INTERVAL detik (default 10 detik).
+        try:
+            from database import ns_flush_worker_loop
+            asyncio.create_task(ns_flush_worker_loop())
+        except Exception as e:
+            print(f"[Startup] ⚠️  ns_flush_worker_loop gagal dimulai: {e}")
+
+        # ── LOG_CHANNEL Flush Worker ───────────────────────────────────────────
+        # Flush antrian log (spam lokal/global, regex, sistem) ke LOG_CHANNEL
+        # secara batch setiap LOG_FLUSH_INTERVAL detik (default 8 detik).
+        # FIXED: Mencegah FloodWait menumpuk saat grup ramai — semua log
+        # dikumpulkan dulu lalu dikirim sebagai 1 pesan gabungan per siklus.
+        try:
+            from plugins.commands.log import log_flush_worker_loop
+            asyncio.create_task(log_flush_worker_loop(app))
+        except Exception as e:
+            print(f"[Startup] ⚠️  log_flush_worker_loop gagal dimulai: {e}")
+
+        # ── Antispam Detection Worker ──────────────────────────────────────────
+        # Worker tunggal yang memproses deteksi spam (regex, mention, link,
+        # dup lokal, dup global) satu per satu dari detection_queue.
+        #
+        # Kenapa perlu worker terpisah:
+        #   bio.py  → 1 bot pemantau per grup (paralel aman, API terdistribusi)
+        #   antispam → 1 bot utama untuk SEMUA grup → harus antrian agar tidak
+        #   ada burst API call (mention check, gcast query) saat banyak grup ramai.
+        #
+        # Koordinasi FloodWait:
+        #   Worker ini memakai set_global_flood_backoff / wait_global_flood_backoff
+        #   yang sama dengan delete_worker, moderation_worker_loop, log_flush_worker_loop
+        #   → semua worker saling mundur saat salah satu kena FloodWait.
+        try:
+            from core.antispam_queue import antispam_detection_worker
+            asyncio.create_task(antispam_detection_worker(app))
+            print("[Startup] ✅ Antispam detection worker siap.", flush=True)
+        except Exception as e:
+            print(f"[Startup] ⚠️  antispam_detection_worker gagal dimulai: {e}")
+
+        # ── Bot Pemantau (Monitor) — independen dari userbot ──────────────────
+        # FIX: Sebelumnya _load_instances_from_db() hanya dipanggil dari dalam
+        # _voice_chat_monitor_loop() di video_call.py — yang hanya berjalan jika
+        # userbot berhasil start. Akibatnya, jika userbot off atau belum punya
+        # session, bot pemantau yang sudah di-generate tidak pernah aktif.
+        #
+        # Solusi: panggil _load_instances_from_db() langsung di sini, setelah
+        # bot utama siap, TANPA menunggu userbot. Bot pemantau berjalan
+        # independen — mereka hanya butuh token di DB, bukan sesi userbot.
+        # _voice_chat_monitor_loop() di video_call.py tetap memanggil
+        # _load_instances_from_db() juga, tapi karena fungsi itu idempotent
+        # (grup yang sudah ada di _active_instances dilewati), tidak ada duplikasi.
+        try:
+            from monitor_bot_reference import (
+                _load_instances_from_db as _monitor_load,
+                _periodic_session_backup as _monitor_session_backup,
+            )
+            await _monitor_load()
+            asyncio.create_task(_monitor_session_backup())
+            print("[Startup] ✅ Bot pemantau (monitor) dimuat dari DB — independen dari userbot.", flush=True)
+        except Exception as e:
+            print(f"[Startup] ⚠️  Gagal load bot pemantau (monitor): {e}", flush=True)
+
+        # ── Mention Member Cache TTL Index ────────────────────────────────────
+        try:
+            from database import ensure_mention_cache_index
+            await ensure_mention_cache_index()
+        except Exception as e:
+            print(f"[Startup] ⚠️  Gagal buat mention cache index: {e}", flush=True)
+
+        # ── Deteksi Ubot TTL Index ────────────────────────────────────────────
+        try:
+            from core.ubot_detect import ensure_ubot_detect_index
+            await ensure_ubot_detect_index()
+        except Exception as e:
+            print(f"[Startup] ⚠️  Gagal buat ubot_detect index: {e}", flush=True)
+
+        print("🚀 Bot Antispam + Nexus AI aktif! Tekan Ctrl+C untuk berhenti.", flush=True)
         await idle()
     except (KeyboardInterrupt, asyncio.CancelledError):
         # graceful_shutdown mungkin sudah dipanggil via SIGTERM handler —
@@ -721,6 +1159,34 @@ if __name__ == "__main__":
     import signal
 
     loop = asyncio.get_event_loop()
+
+    # ── Exception handler global — redam noise PeerIdInvalid dari Pyrogram ──
+    # Bot pemantau (monitor_bot_reference.py) menjalankan banyak Client
+    # Pyrogram sekaligus. Saat Telegram mengirim raw update untuk sebuah
+    # channel yang BELUM dikenal sesi monitor tertentu (belum punya peer
+    # cache/access_hash-nya), Client.handle_updates() internal Pyrogram
+    # melempar exception (PeerIdInvalid / KeyError: ID not found) di dalam
+    # task-nya sendiri — bukan di kode kita, jadi tidak tertangkap try/except
+    # manapun di aplikasi. Exception ini TIDAK FATAL (peer akan dikenal
+    # dengan sendirinya begitu monitor benar-benar berinteraksi dengan
+    # channel itu), tapi membanjiri log sebagai "Task exception was never
+    # retrieved" lengkap dengan traceback panjang.
+    #
+    # Handler ini meredam KHUSUS exception jenis itu (cukup 1 baris info),
+    # dan tetap menampilkan traceback lengkap untuk exception lain yang
+    # benar-benar perlu diperhatikan.
+    def _global_exception_handler(loop, context):
+        exc = context.get("exception")
+        msg = context.get("message", "")
+        if isinstance(exc, (KeyError, ValueError)) and (
+            "Peer id invalid" in str(exc) or "ID not found" in str(exc)
+        ):
+            print(f"[Pyrogram] ℹ️  Peer belum dikenal sesi monitor (diabaikan, tidak fatal): {exc}")
+            return
+        # Exception lain yang tidak dikenali — tetap tampilkan penuh seperti default asyncio
+        loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_global_exception_handler)
 
     # ── SIGTERM handler ───────────────────────────────────────────────────────
     # Railway (dan Docker) mengirim SIGTERM saat redeploy/stop — bukan SIGINT.

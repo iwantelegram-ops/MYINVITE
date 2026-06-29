@@ -1,1 +1,1 @@
-worker: python antigcast.py
+worker: python -u antigcast.py
