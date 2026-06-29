@@ -155,42 +155,9 @@ async def cb_secos_setmon(client: Client, cb: CallbackQuery):
         "_task":   None,
     }
 
-    # Ambil username userbot untuk tombol adminkan
-    ub_uname = ""
-    try:
-        from video_call import userbot as _ub
-        if _ub:
-            _ub_me = await _ub.get_me()
-            ub_uname = _ub_me.username or ""
-    except Exception:
-        pass
-
-    ub_admin_url = (
-        f"tg://resolve?domain={ub_uname}&action=addadmin"
-        if ub_uname else None
-    )
-
     buttons = [
         [InlineKeyboardButton("🚫  Batalkan", callback_data=f"secos_panel_{chat_id}")]
     ]
-    if ub_admin_url:
-        buttons.insert(0, [
-            InlineKeyboardButton(
-                f"👑  Adminkan @{ub_uname} (Userbot) ke Grup",
-                url=ub_admin_url,
-            )
-        ])
-
-    ub_admin_text = (
-        f"\n\n<b>4️⃣ Adminkan Userbot ke Grup. ( tidak wajib jika hanya untuk menyalakan bio cek di typingan grup )</b>\n"
-        f"   Tekan tombol di bawah untuk memberi hak admin ke "
-        f"<b>@{ub_uname}</b> (userbot) di grup ini.\n"
-        f"   Izin minimal: <code>Kelola Obrolan Video</code>."
-        if ub_uname else
-        f"\n\n<b>4️⃣ Adminkan Userbot ke Grup. ( tidak wajib jika hanya untuk menyalakan bio cek di typingan grup )</b>\n"
-        f"   Setelah bot pemantau terpasang, cari userbot di daftar member grup\n"
-        f"   dan jadikan admin dengan izin <code>Kelola Obrolan Video</code>."
-    )
 
     await safe_edit(
         cb.message,
@@ -202,12 +169,15 @@ async def cb_secos_setmon(client: Client, cb: CallbackQuery):
         f"<b>1️⃣ Buat Bot via @BotFather</b>\n"
         f"   Buka @BotFather → <code>/newbot</code> → ikuti instruksi → salin token.\n\n"
         f"<b>2️⃣ Kirim token ke sini</b>\n"
-        f"   Token berbentuk: <code>123456789:ABCdef...</code>\n"
-        f"   Bot pemantau akan otomatis di-deploy & dipasang ke grup ini.\n\n"
-        f"<b>3️⃣ Jadikan Bot Pemantau Member Grup</b>\n"
-        f"   Bot Otomatis Bekerja, Atau Tambahkan sebagai <b>admin</b>\n"
-        f"   di grup agar lebih akurat (opsional)."
-        f"{ub_admin_text}\n\n"
+        f"   Token berbentuk: <code>123456789:ABCdef...</code>\n\n"
+        f"<b>3️⃣ Selesai — sisanya otomatis</b>\n"
+        f"   Begitu token valid, bot akan otomatis:\n"
+        f"   ◈ Mengundang userbot ke grup (jika belum jadi member)\n"
+        f"   ◈ Mengadminkan userbot dengan izin <code>Kelola Obrolan Video</code> + <code>Undang Pengguna</code>\n"
+        f"   ◈ Mengundang bot pemantau ke grup lewat userbot\n\n"
+        f"   Jika salah satu langkah gagal (misal grup privat & userbot belum\n"
+        f"   bisa diundang otomatis), kamu akan diberi instruksi manual yang\n"
+        f"   presisi — hanya untuk langkah yang gagal.\n\n"
         f"◈ 1 bot pemantau hanya boleh dipakai di <b>1 grup</b>.\n"
         f"◈ Token bot lama otomatis digantikan jika kamu memasukkan token baru.\n\n"
         f"<i>⏳ Batas waktu input: {WAIT_TIMEOUT // 60} menit.</i>\n"
@@ -322,43 +292,11 @@ async def handle_setmon_input(client: Client, message: Message):
     from video_call import setup_monitor_bot
     ok, result_msg = await setup_monitor_bot(chat_id, text, client)
 
-    # Ambil username userbot untuk tombol adminkan (ditampilkan di pesan sukses)
-    _ub_uname_success = ""
-    try:
-        from video_call import userbot as _ub2
-        if _ub2:
-            _ub_me2 = await _ub2.get_me()
-            _ub_uname_success = _ub_me2.username or ""
-    except Exception:
-        pass
-
     if ok:
         page_text, keyboard = await page_security_os(chat_id, client)
-        ub_admin_note = (
-            f"\n👑 Jangan lupa adminkan userbot <b>@{_ub_uname_success}</b> "
-            f"ke grup dengan izin <code>Kelola Obrolan Video</code>.\n"
-            if _ub_uname_success else
-            "\n👑 Jangan lupa adminkan userbot ke grup (izin: Kelola Obrolan Video).\n"
-        )
-        # Tambah tombol adminkan userbot jika username tersedia
-        if _ub_uname_success:
-            from pyrogram.types import InlineKeyboardButton as _IKB
-            existing_buttons = keyboard.inline_keyboard if keyboard else []
-            ub_btn_row = [_IKB(
-                f"👑  Adminkan @{_ub_uname_success} ke Grup",
-                url=f"tg://resolve?domain={_ub_uname_success}&action=addadmin",
-            )]
-            from pyrogram.types import InlineKeyboardMarkup as _IKM
-            keyboard = _IKM([ub_btn_row] + existing_buttons)
-
         final_text = (
             f"✅ <b>Bot pemantau berhasil dikonfigurasi!</b>\n"
             f"{result_msg}\n\n"
-            f"⚠️ <b>Langkah selanjutnya:</b>\n"
-            f"1️⃣ Tambahkan bot pemantau ke grup secara manual (Kelola Grup → Tambah Member).\n"
-            f"   Bot akan <b>dikenali otomatis</b> saat masuk ke grup.\n"
-            f"2️⃣ Jadikan bot pemantau sebagai <b>admin grup</b>.\n"
-            f"3️⃣{ub_admin_note}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n{page_text}"
         )
     else:
