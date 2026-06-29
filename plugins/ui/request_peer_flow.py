@@ -39,7 +39,7 @@ _PERJANJIAN_TEXT = (
     "◈ <b>Hapus Pesan</b> — untuk menghapus spam secara otomatis\n"
     "◈ <b>Batasi Anggota</b> — untuk mute/ban akun terverifikasi berbahaya\n"
     "◈ <b>Dan Semua Ijin Admin</b> — untuk menjalankan seluruh fiturnya\n\n"
-    "Kedua hak ini <b>semata-mata digunakan untuk fungsi perlindungan</b>. "
+    "Kedua hak ini <b>semata-mata digunakan untuk fungsi perlindungan</b>.\n"
     "Bot tidak akan pernah menggunakannya untuk kepentingan lain.\n\n"
 
     "🛡️ <b>Jaminan Integritas</b>\n"
