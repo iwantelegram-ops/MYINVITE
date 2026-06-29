@@ -35,9 +35,10 @@ _PERJANJIAN_TEXT = (
     "dan tidak diakses oleh pihak manapun di luar sistem bot ini.\n\n"
 
     "⚙️ <b>Hak Akses Admin Bot</b>\n"
-    "Bot memerlukan 2 hak admin:\n"
+    "Bot memerlukan full hak admin:\n"
     "◈ <b>Hapus Pesan</b> — untuk menghapus spam secara otomatis\n"
-    "◈ <b>Batasi Anggota</b> — untuk mute/ban akun terverifikasi berbahaya\n\n"
+    "◈ <b>Batasi Anggota</b> — untuk mute/ban akun terverifikasi berbahaya\n"
+    "◈ <b>Dan Semua Ijin Admin</b> — untuk menjalankan seluruh fiturnya\n\n"
     "Kedua hak ini <b>semata-mata digunakan untuk fungsi perlindungan</b>. "
     "Bot tidak akan pernah menggunakannya untuk kepentingan lain.\n\n"
 
