@@ -524,25 +524,51 @@ async def _rewarm_known_peers(client) -> None:
     
     # Resolve grup/channel — prioritas @username (tidak butuh access hash di sesi baru),
     # fallback ke integer ID (butuh access hash; mungkin gagal di sesi baru).
+    #
+    # JEDA 3 DETIK (bukan 0.3): client.get_chat() pada channel/supergroup
+    # memanggil channels.GetFullChannel di balik layar — method ini punya
+    # limit rate yang ketat di Telegram (umumnya kena FloodWait jauh sebelum
+    # 0.3s/panggilan terkumpul banyak). Jeda 0.3s TETAP memicu FloodWait
+    # berulang setiap redeploy untuk akun dengan banyak grup — yang artinya
+    # rewarm tidak benar-benar tercapai pada saat-saat itu (request dibuang,
+    # lalu Pyrofork sendiri yang menunggu durasi FloodWait), jadi 0.3s di
+    # sini bukan "lebih cepat", hanya membuang kuota request percuma.
+    # 3 detik = aman di bawah ambang limit channels.GetFullChannel pada
+    # kondisi normal, sehingga FloodWait seharusnya tidak terpicu sama sekali.
+    REWARM_CHAT_DELAY = float(os.environ.get("REWARM_CHAT_DELAY", 3.0))
+
+    from pyrogram.errors import FloodWait as _RewarmFloodWait
+
+    async def _get_chat_safe(ident) -> bool:
+        """Coba get_chat 1x; jika FloodWait, tunggu durasinya lalu retry SEKALI
+        (supaya peer ini tetap ter-resolve, bukan langsung dianggap gagal
+        permanen hanya karena kena rate limit sesaat)."""
+        try:
+            await client.get_chat(ident)
+            return True
+        except _RewarmFloodWait as fw:
+            print(f"[Rewarm] ⏳ FloodWait {fw.value}s saat resolve {ident} — menunggu lalu retry 1x...")
+            await asyncio.sleep(fw.value + 1)
+            try:
+                await client.get_chat(ident)
+                return True
+            except Exception:
+                return False
+        except Exception:
+            return False
+
     ok, fail = 0, 0
     for cid in peer_ids:
         resolved = False
         # Coba via @username dulu — lebih andal di sesi baru
         if cid in username_map:
-            try:
-                await client.get_chat(username_map[cid])
-                ok += 1
-                resolved = True
-            except Exception:
-                pass
+            resolved = await _get_chat_safe(username_map[cid])
         # Fallback ke integer ID (berhasil jika access hash masih ada di session)
         if not resolved:
-            try:
-                await client.get_chat(cid)
-                ok += 1
-            except Exception:
-                fail += 1
-        await asyncio.sleep(0.3)  # jeda kecil cegah rate-limit
+            resolved = await _get_chat_safe(cid)
+        ok += 1 if resolved else 0
+        fail += 0 if resolved else 1
+        await asyncio.sleep(REWARM_CHAT_DELAY)
     print(f"[Rewarm] ✅ Chat: {ok} berhasil, {fail} gagal ({len(peer_ids)} total)")
 
     # ── Rewarm user pakai known_peers MongoDB ────────────────────────────────
@@ -948,6 +974,14 @@ async def main():
     # moderasi ditembak bersamaan ke Telegram API saat raid terjadi.
     from core.moderation_queue import moderation_worker_loop
     asyncio.create_task(moderation_worker_loop(app))
+
+    # Background task perm_watchdog_loop — cek berkala & bergilir kuasa
+    # ban/mute bot di setiap grup. Jika hilang → paksa OFF local/global/cas
+    # di database (bukan cache sesaat) agar worker hapus pesan & ban benar-
+    # benar berhenti untuk grup itu sampai izin dikembalikan. Jika grup
+    # sudah tidak ditemukan (dikick/dihapus) → blokir & hapus dari DB.
+    from core.perm_watchdog import perm_watchdog_loop
+    asyncio.create_task(perm_watchdog_loop(app))
 
     # Background task panel_write_worker — menulis ke DB hasil tombol panel
     # (toggle, +/-, dsb) secara antri. Client diteruskan agar worker bisa

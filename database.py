@@ -1885,6 +1885,172 @@ def invalidate_bot_perm_cache(chat_id: int) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PERM WATCHDOG — pengecekan berkala izin ban/mute per grup (lihat core/perm_watchdog.py)
+#
+# Berbeda dari check_bot_permissions() (reaktif, dipicu pesan masuk, cache 5 menit,
+# fail-open saat error API): watchdog ini PROAKTIF, jalan terus berkala bahkan
+# untuk grup yang sepi pesan, dan saat izin ban/mute hilang ia menulis status
+# OFF ke DATABASE (bukan cache sesaat) — sehingga toggle panel ikut berubah dan
+# kondisinya bertahan walau cache check_bot_permissions kosong/fail-open.
+# ══════════════════════════════════════════════════════════════════════════════
+
+blocked_groups_db = db["blocked_groups"]
+
+# Toggle yang menjalankan EKSEKUSI hapus/ban — dipaksa OFF saat kuasa ban/mute
+# hilang. TIDAK termasuk: ubot_detect (rekam selalu jalan, independen),
+# anti_mention/mention record, dan Nexus AI passive learning — ketiganya
+# sudah didesain untuk tetap jalan tanpa izin admin (lihat masing-masing filter).
+_PERM_GATED_TOGGLES = ("local", "global", "cas")
+
+
+async def force_disable_group_moderation(chat_id: int) -> bool:
+    """
+    Paksa matikan toggle yang berujung pada eksekusi hapus pesan/ban
+    (local, global, cas) untuk chat_id, dan tandai grup ini sebagai
+    "dimatikan oleh watchdog" (perm_forced_off=True) — bukan oleh admin grup.
+
+    Return True jika ada perubahan (sebelumnya minimal satu toggle ON),
+    False jika grup sudah dalam keadaan OFF semua (tidak ada yang berubah).
+    """
+    cfg = await get_config(chat_id)
+    already_off = not any(cfg.get(k) for k in _PERM_GATED_TOGGLES)
+
+    updates = {k: False for k in _PERM_GATED_TOGGLES}
+    updates["perm_forced_off"] = True
+    await config_db.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"chat_id": chat_id, **updates}},
+        upsert=True,
+    )
+    _config_cache.pop(chat_id, None)
+    invalidate_bot_perm_cache(chat_id)
+
+    if already_off:
+        return False
+    print(f"[PermWatchdog] ⛔ Grup {chat_id}: kuasa ban/mute hilang — "
+          f"local/global/cas dipaksa OFF.")
+    return True
+
+
+async def restore_group_moderation_if_forced(chat_id: int) -> bool:
+    """
+    Nyalakan kembali local/global ke True HANYA jika grup ini sebelumnya
+    dimatikan oleh watchdog (perm_forced_off=True) — tidak menimpa pilihan
+    admin grup yang mematikan fitur secara manual.
+
+    `cas` SENGAJA TIDAK di-restore otomatis — CAS adalah auto-ban global
+    yang lebih sensitif, biar admin grup yang menyalakan ulang secara sadar
+    lewat panel setelah memverifikasi izin bot benar-benar pulih.
+
+    Return True jika grup ini di-restore, False jika tidak perlu (tidak
+    pernah di-force-off oleh watchdog).
+    """
+    cfg = await get_config(chat_id)
+    if not cfg.get("perm_forced_off"):
+        return False
+
+    await config_db.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"local": True, "global": True, "perm_forced_off": False}},
+    )
+    _config_cache.pop(chat_id, None)
+    print(f"[PermWatchdog] ✅ Grup {chat_id}: kuasa ban/mute pulih — "
+          f"local/global diaktifkan kembali (cas tetap OFF, perlu manual).")
+    return True
+
+
+async def block_and_remove_group(chat_id: int, reason: str) -> None:
+    """
+    Grup tidak ditemukan lagi (bot dikick / grup mati / dihapus). Hapus data
+    operasionalnya dari config_db (lewat remove_group_data) DAN catat
+    permanen ke blocked_groups agar grup ini tidak diam-diam terdaftar lagi
+    kalau suatu saat bot diundang balik tanpa sepengetahuan owner.
+    """
+    await blocked_groups_db.update_one(
+        {"chat_id": chat_id},
+        {"$set": {
+            "chat_id":    chat_id,
+            "reason":     reason,
+            "blocked_at": datetime.now(TZ_WIB),
+        }},
+        upsert=True,
+    )
+    await remove_group_data(chat_id)
+    print(f"[PermWatchdog] 🚫 Grup {chat_id} diblokir & dihapus dari DB ({reason}).")
+
+
+async def is_group_blocked(chat_id: int) -> bool:
+    """True jika chat_id ada di daftar blocked_groups."""
+    doc = await blocked_groups_db.find_one({"chat_id": chat_id})
+    return doc is not None
+
+
+async def get_all_known_group_ids() -> list[int]:
+    """
+    Kembalikan semua chat_id grup yang dikenal di config_db (bukan channel),
+    dipakai watchdog untuk iterasi bergilir. Channel (chat_type=CHANNEL
+    tersimpan) dikecualikan karena tidak relevan dengan moderasi grup.
+    """
+    ids: list[int] = []
+    async for doc in config_db.find({}):
+        chat_id = doc.get("chat_id")
+        if not chat_id:
+            continue
+        if (doc.get("chat_type") or "").upper() == "CHANNEL":
+            continue
+        ids.append(chat_id)
+    return ids
+
+
+async def get_all_groups_with_perm_status() -> list[dict]:
+    """
+    Kembalikan SEMUA grup yang memakai bot (sumber: config_db — bukan
+    nexus_grup_db yang isinya hanya grup yang pernah trigger /spam atau
+    event member-update), beserta status izin ban/mute TERKINI.
+
+    Dipakai oleh panel "Grup Terdaftar" (Nexus AI > Owner Bot) supaya owner
+    tidak melihat daftar yang menyesatkan — grup tanpa izin ban/mute (sudah
+    di-force-off oleh perm_watchdog) HARUS terlihat statusnya, bukan tampil
+    polos seolah normal.
+
+    Grup yang sudah mati/bot-dikick TIDAK akan muncul di sini sama sekali,
+    karena perm_watchdog menghapusnya dari config_db (lihat
+    block_and_remove_group) — daftar ini otomatis hanya berisi grup yang
+    masih aktif memakai bot saat ini.
+
+    Channel dikecualikan (sama seperti get_all_known_group_ids).
+
+    Setiap item:
+      {
+        "chat_id":         int,
+        "title":           str,
+        "username":        str | None,
+        "invite_link":     str | None,  # hanya terisi untuk grup privat
+        "has_ban_perm":    bool,  # status TERKINI (perm_forced_off==False)
+        "forced_off":      bool,  # True jika watchdog yang mematikan, bukan admin
+      }
+    """
+    result: list[dict] = []
+    async for doc in config_db.find({}):
+        chat_id = doc.get("chat_id")
+        if not chat_id:
+            continue
+        if (doc.get("chat_type") or "").upper() == "CHANNEL":
+            continue
+
+        forced_off   = bool(doc.get("perm_forced_off", False))
+        result.append({
+            "chat_id":      chat_id,
+            "title":        doc.get("title") or str(chat_id),
+            "username":     doc.get("username"),
+            "invite_link":  doc.get("invite_link"),
+            "has_ban_perm": not forced_off,
+            "forced_off":   forced_off,
+        })
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ADMIN CACHE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2357,15 +2523,83 @@ async def save_group_title(chat_id: int, title: str) -> None:
 
 
 async def save_group_username(chat_id: int, username: str | None) -> None:
-    """Simpan username grup ke config_db agar bisa di-resolve via @username saat rewarm."""
-    if not username:
-        return
+    """
+    Simpan/update username grup ke config_db agar bisa di-resolve via
+    @username saat rewarm.
+
+    Username None DITULIS juga (bukan diabaikan) — kalau grup berubah dari
+    publik→privat, field lama harus ikut hilang, supaya panel "Grup
+    Terdaftar" tidak menampilkan link t.me/username basi yang sudah tidak
+    berlaku (lihat refresh_group_public_info).
+    """
     await config_db.update_one(
         {"chat_id": chat_id},
-        {"$set": {"username": username}},
+        {"$set": {"chat_id": chat_id, "username": username}},
         upsert=True,
     )
     _config_cache.pop(chat_id, None)
+
+
+async def save_group_invite_link(chat_id: int, invite_link: str | None) -> None:
+    """Simpan/update invite link grup privat ke config_db."""
+    await config_db.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"chat_id": chat_id, "invite_link": invite_link}},
+        upsert=True,
+    )
+    _config_cache.pop(chat_id, None)
+
+
+async def refresh_group_public_info(client, chat_id: int) -> None:
+    """
+    Sinkronkan info akses publik grup (username ATAU invite link) ke
+    config_db supaya tidak basi — dipanggil berkala oleh perm_watchdog
+    untuk setiap grup yang masih aktif.
+
+    Aturan:
+      • Grup PUBLIK (punya @username) → simpan username terbaru, HAPUS
+        invite_link tersimpan (tidak relevan lagi, grup sudah publik).
+      • Grup PRIVAT (tidak ada @username) → simpan username=None, lalu
+        coba buat 1 invite link via export_chat_invite_link().
+          - Telegram me-reuse link primer yang masih aktif jika ada, dan
+            hanya generate baru jika link lama sudah di-revoke/dihapus
+            owner — jadi aman dipanggil berkala, TIDAK membuat link baru
+            setiap siklus selama link lama masih hidup.
+          - Jika bot tidak punya izin invite (ChatAdminRequired) → SKIP
+            diam-diam, tidak melempar error, invite_link lama (jika ada)
+            dibiarkan apa adanya (lebih baik link basi yang masih bisa
+            dicoba daripada tidak ada sama sekali).
+
+    Dipanggil dengan try/except oleh caller — fungsi ini sendiri tidak
+    melempar exception ke pemanggil untuk error apapun selain bug internal.
+    """
+    from pyrogram.errors import ChatAdminRequired, UserNotParticipant, FloodWait
+
+    try:
+        chat = await client.get_chat(chat_id)
+    except Exception:
+        return  # grup tidak terakses sekarang — perm_watchdog yang urus status grup hilang
+
+    username = getattr(chat, "username", None)
+    await save_group_username(chat_id, username)
+    await save_group_title(chat_id, chat.title or str(chat_id))
+
+    if username:
+        # Grup publik — invite link tidak relevan lagi, bersihkan sisa lama.
+        await save_group_invite_link(chat_id, None)
+        return
+
+    # Grup privat — coba pastikan ada 1 invite link valid.
+    try:
+        link = await client.export_chat_invite_link(chat_id)
+        if link:
+            await save_group_invite_link(chat_id, link)
+    except (ChatAdminRequired, UserNotParticipant):
+        pass  # tidak ada izin undang — skip, jangan error
+    except FloodWait:
+        pass  # rate limit sesaat — coba lagi siklus watchdog berikutnya
+    except Exception as e:
+        print(f"[GroupInfo] Gagal export invite link grup {chat_id}: {e}")
 
 
 async def remove_group_data(chat_id: int) -> None:
