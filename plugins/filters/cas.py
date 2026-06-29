@@ -19,6 +19,8 @@ VIP:
 import os
 import httpx
 import time
+import html
+import asyncio
 from datetime import datetime
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -27,8 +29,12 @@ from pyrogram.enums import ParseMode
 from database import (
     db, auto_delete_reply, is_admin, delete_queue,
     update_config, save_group_title, save_group_username, remove_group_data,
-    TZ_WIB, mark_message_handled, insert_group_action_log,
+    TZ_WIB, mark_message_handled, insert_group_action_log, get_config,
+    check_bot_permissions, invalidate_bot_perm_cache,
 )
+from core.group_notify import send_group_notice
+from core.moderation_queue import queue_ban
+from core.violation_types import VIOLATION_CAS_BAN, VIOLATION_BAN_GAGAL, format_violation_header
 
 DELAY_NOTIF   = 10
 LOG_CHANNEL   = int(os.environ.get("LOG_CHANNEL", 0))
@@ -67,7 +73,7 @@ def _resolve_target(message: Message):
 
 
 # ── /wlcas ──────────────────────────────────────────────────────────────────────
-@Client.on_message(filters.command("wlcas") & filters.group)
+@Client.on_message(filters.command("wlcas") & (filters.group | filters.forum))
 async def add_whitelist(client: Client, message: Message):
     cid = message.chat.id
     if not await is_admin(client, cid, message.from_user.id if message.from_user else None):
@@ -82,7 +88,8 @@ async def add_whitelist(client: Client, message: Message):
             "② Kirim ID langsung → <code>/wlcas 123456789</code>",
             parse_mode=ParseMode.HTML
         )
-        return await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+        asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
+        return
 
     await whitelist_col.update_one(
         {"user_id": target_id, "chat_id": cid},
@@ -95,11 +102,11 @@ async def add_whitelist(client: Client, message: Message):
         f"<i>User ini tidak akan ter-ban oleh CAS di grup ini.</i>",
         parse_mode=ParseMode.HTML
     )
-    await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+    asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
 
 
 # ── /unwlcas ─────────────────────────────────────────────────────────────────────
-@Client.on_message(filters.command("unwlcas") & filters.group)
+@Client.on_message(filters.command("unwlcas") & (filters.group | filters.forum))
 async def remove_whitelist(client: Client, message: Message):
     cid = message.chat.id
     if not await is_admin(client, cid, message.from_user.id if message.from_user else None):
@@ -114,7 +121,8 @@ async def remove_whitelist(client: Client, message: Message):
             "② Kirim ID langsung → <code>/unwlcas 123456789</code>",
             parse_mode=ParseMode.HTML
         )
-        return await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+        asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
+        return
 
     result = await whitelist_col.delete_one({"user_id": target_id, "chat_id": cid})
     text = (
@@ -125,11 +133,11 @@ async def remove_whitelist(client: Client, message: Message):
         f"👤 <b>User ID:</b> <code>{target_id}</code>"
     )
     res = await message.reply(text, parse_mode=ParseMode.HTML)
-    await auto_delete_reply([res, message], delay=DELAY_NOTIF)
+    asyncio.create_task(auto_delete_reply([res, message], delay=DELAY_NOTIF))
 
 
 # ── CAS Auto-Mod ──────────────────────────────────────────────────────────────
-@Client.on_message(filters.group & ~filters.service, group=-1)
+@Client.on_message((filters.group | filters.forum) & ~filters.service, group=-1)
 async def cas_auto_mod(client: Client, message: Message):
     if not message.from_user or message.from_user.is_bot:
         return
@@ -137,6 +145,15 @@ async def cas_auto_mod(client: Client, message: Message):
     uid     = message.from_user.id
     cid     = message.chat.id
     mid     = message.id
+
+    # ── Cek izin bot: HARUS punya delete_messages DAN restrict_members ───────
+    # Jika salah satu tidak ada → skip grup ini sepenuhnya (tidak inspect sama sekali).
+    if not await check_bot_permissions(client, cid):
+        return
+
+    cfg = await get_config(cid)
+    if not cfg.get("cas", False):
+        return
 
     if await whitelist_col.find_one({"user_id": uid, "chat_id": cid}):
         return
@@ -149,16 +166,21 @@ async def cas_auto_mod(client: Client, message: Message):
         return
 
     if await is_cas_banned(uid):
-        try:
-            await client.ban_chat_member(cid, uid)
-            mark_message_handled(cid, mid)
-            await delete_queue.put((cid, [mid]))
+        mark_message_handled(cid, mid)
+        await delete_queue.put((cid, [mid]))
 
+        async def _on_ban_done(success: bool):
+            if not success:
+                # Bot kemungkinan bukan admin / kehilangan izin ban di grup ini.
+                # Pesan sudah terlanjur dihapus (memang spam terverifikasi),
+                # tapi user TIDAK ter-ban — beri tahu owner via LOG_CHANNEL.
+                asyncio.create_task(_log_cas_ban_failed(client, message))
+                return
             waktu = datetime.now(TZ_WIB).strftime("%d/%m/%Y %H:%M:%S WIB")
 
-            # Notifikasi publik ke grup
-            alert = await client.send_message(
-                cid,
+            # Notifikasi publik ke grup (rate-limited per grup, lihat core/group_notify.py)
+            alert = await send_group_notice(
+                client, cid,
                 f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
                 f"┃      🛡️  <b>CAS ANTI-SPAM</b>       ┃\n"
                 f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
@@ -167,9 +189,11 @@ async def cas_auto_mod(client: Client, message: Message):
                 f"🆔 <b>ID:</b> <code>{uid}</code>\n\n"
                 f"⚠️ <b>Alasan:</b> Terdeteksi di database spammer global CAS.\n\n"
                 f"<i>CAS memproteksi dari 200.000+ spammer yang sudah diverifikasi.</i>",
-                parse_mode=ParseMode.HTML
+                notice_kind="cas_ban",
+                parse_mode=ParseMode.HTML,
             )
-            await auto_delete_reply([alert], delay=DELAY_NOTIF)
+            if alert is not None:
+                asyncio.create_task(auto_delete_reply([alert], delay=DELAY_NOTIF))
 
             # Log ke channel owner
             await _log_cas_ban(client, message, waktu)
@@ -181,10 +205,13 @@ async def cas_auto_mod(client: Client, message: Message):
                     uid,
                     message.from_user.first_name or str(uid),
                     (message.text or message.caption or "")[:100],
+                    jenis=VIOLATION_CAS_BAN,
                 )
             except Exception:
                 pass
 
+        try:
+            await queue_ban(cid, uid, on_done=_on_ban_done)
         except Exception as e:
             print(f"⚠️  CAS-Error [chat={cid}]: {e}")
 
@@ -194,31 +221,49 @@ async def _log_cas_ban(client: Client, message: Message, waktu: str):
     if not LOG_CHANNEL:
         return
 
+    from plugins.commands.log import _send_log, _user_line
+
     uid          = message.from_user.id
     cid          = message.chat.id
-    user_mention = f"<a href='tg://user?id={uid}'>{message.from_user.first_name}</a>"
+    user_mention = _user_line(uid, message.from_user.first_name)
     content      = (message.text or message.caption or "—").strip()
 
     log_text = (
-        "<b>❖ CAS ANTI-SPAM ❖</b>\n"
-        "🚫 <b>User Di-Ban — Spammer Global Terverifikasi</b>\n"
-        "<blockquote expandable>"
-        f"◈ <b>User:</b> {user_mention} (<code>{uid}</code>)\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
+        f"<b>❖ {format_violation_header(VIOLATION_CAS_BAN)} ❖</b>\n"
+        f"◈ <b>User:</b> {user_mention}\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {waktu}\n"
-        "◈ <b>Sumber:</b> Database CAS (cas.chat)\n"
-        "◈ <b>Aksi:</b> Ban permanen + hapus pesan\n\n"
-        f"<b>Konten:</b> <code>{content[:500]}</code>"
-        "</blockquote>"
+        f"◈ <b>Sumber verifikasi:</b> Database CAS (cas.chat)\n"
+        f"◈ <b>Keterangan:</b> User terdaftar sebagai spammer global terverifikasi\n"
+        f"◈ <b>Aksi:</b> Ban permanen + pesan dihapus\n\n"
+        f"📨 <b>Pesan terakhir:</b>\n<code>{html.escape(content[:500])}</code>"
     )
-    try:
-        await client.send_message(
-            LOG_CHANNEL, log_text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        print(f"[CAS LOG ERROR] {e}")
+    await _send_log(client, log_text)
+
+
+async def _log_cas_ban_failed(client: Client, message: Message):
+    """
+    Peringatkan owner via LOG_CHANNEL saat eksekusi ban CAS gagal.
+    """
+    if not LOG_CHANNEL:
+        return
+
+    from plugins.commands.log import _send_log, _user_line, _fmt_waktu
+
+    uid          = message.from_user.id
+    cid          = message.chat.id
+    user_mention = _user_line(uid, message.from_user.first_name)
+
+    log_text = (
+        f"<b>❖ {format_violation_header(VIOLATION_BAN_GAGAL)} ❖</b>\n"
+        f"◈ <b>User:</b> {user_mention}\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
+        f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
+        f"◈ <b>Keterangan:</b> User terdeteksi spammer CAS, namun ban gagal dieksekusi\n"
+        f"◈ <b>Penyebab:</b> Bot tidak punya izin admin untuk mem-ban member\n"
+        f"<i>⚠️ Pesan sudah dihapus, tapi user TIDAK ter-ban — segera cek izin admin bot di grup ini.</i>"
+    )
+    await _send_log(client, log_text)
 
 
 # ── Bot masuk grup → init config ──────────────────────────────────────────────
@@ -227,7 +272,7 @@ async def handle_bot_join(client: Client, message: Message):
     if not message.new_chat_members:
         return
     for member in message.new_chat_members:
-        if member.id == (await client.get_me()).id:
+        if member.id == client.me.id:
             await update_config(message.chat.id, "local", True)
             try:
                 chat = await client.get_chat(message.chat.id)
@@ -244,7 +289,7 @@ async def handle_bot_join(client: Client, message: Message):
                 "🔁 Anti Spam Lokal    → <code>🟢 ON</code>\n"
                 "🌐 Anti Gcast Global  → <code>🟢 ON</code>\n"
                 "🔍 Bio Link Detector  → <code>🔴 OFF</code>\n"
-                "🛡️ CAS Anti-Spam      → <code>🟢 SELALU</code>\n\n"
+                "🛡️ CAS Anti-Spam      → <code>🔴 OFF</code>\n\n"
                 "━━━ ⚙️ <b>KONFIGURASI</b> ━━━\n\n"
                 "<i>Gunakan <code>/antigcast</code> untuk panel kontrol interaktif via DM.</i>",
                 parse_mode=ParseMode.HTML
@@ -255,13 +300,18 @@ async def handle_bot_join(client: Client, message: Message):
 @Client.on_chat_member_updated()
 async def handle_bot_status_change(client: Client, update):
     try:
-        me = await client.get_me()
+        me = client.me
         if not update.new_chat_member or update.new_chat_member.user.id != me.id:
             return
 
         from pyrogram.enums import ChatMemberStatus
         new_status = update.new_chat_member.status
         chat_id    = update.chat.id
+
+        # Status/izin bot berubah (di-promote, di-demote, izin diubah, dll.)
+        # → cache check_bot_permissions basi, hapus agar grup ini langsung
+        # dicek ulang pada pesan berikutnya (tidak menunggu TTL 5 menit).
+        invalidate_bot_perm_cache(chat_id)
 
         if new_status in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT):
             await remove_group_data(chat_id)
@@ -280,7 +330,7 @@ async def handle_bot_status_change(client: Client, update):
 
 
 # ── Nama grup berubah → perbarui title di database ───────────────────────────
-@Client.on_message(filters.group & filters.service)
+@Client.on_message((filters.group | filters.forum) & filters.service)
 async def handle_chat_title_change(client: Client, message: Message):
     try:
         if message.new_chat_title:

@@ -42,6 +42,7 @@ FALLBACK AMAN:
 import os
 import asyncio
 import time
+import html
 from datetime import datetime
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -52,8 +53,10 @@ from database import (
     is_admin, delete_queue, get_config,
     db, TZ_WIB,
     mark_message_handled, is_message_handled, insert_group_action_log,
+    check_bot_permissions,
 )
 from core.punishment import check_and_punish
+from core.violation_types import VIOLATION_BIO_LINK, format_violation_header
 
 free_col    = db["free_per_group"]
 bio_col     = db["bio_profiles"]    # Ditulis oleh bot pemantau masing-masing grup
@@ -67,7 +70,18 @@ LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", 0))
 _mem_cache: dict[tuple[int, int], tuple[bool, float]] = {}
 # BUG 3 FIX: TTL 60 detik — sinkron dengan BIO_TTL_SECS (monitor_bot) &
 # _BIO_CACHE_TTL (userbot). Semua layer cache hancur dalam waktu yang sama.
-_MEM_CACHE_TTL = float(os.environ.get("BIO_TTL_SECS", 60))
+# Satu-satunya sumber kebenaran TTL bio: BIO_TTL_SECS di .env.
+# Default 300 — konsisten dengan monitor_bot_reference.py dan video_call.py.
+_MEM_CACHE_TTL = float(os.environ.get("BIO_TTL_SECS", 300))
+
+# ── VIP bio cache: apakah user ini VIP berdasarkan teks bio-nya ───────────────
+# Key: (chat_id, user_id), Value: (is_vip: bool, cache_ts: float)
+# TTL menggunakan nilai yang SAMA dengan _MEM_CACHE_TTL agar kedua cache
+# expired bersamaan — pengecekan VIP selalu berjalan 1x bersama cek bio link.
+# Tidak ada API tambahan: data bio sudah di-fetch oleh bot pemantau, kita
+# hanya membaca field "bio" dari dokumen yang sama di bio_profiles.
+_VIP_BIO_CACHE_TTL = _MEM_CACHE_TTL  # ikut BIO_TTL_SECS — 1 env var mengatur semua
+_vip_bio_cache: dict[tuple[int, int], tuple[bool, float]] = {}
 
 # ── Throttle typing handler bot utama ─────────────────────────────────────────
 # Untuk mencegah force_check_user dipanggil terlalu sering dari sisi bot utama.
@@ -123,9 +137,189 @@ def _update_mem_cache(chat_id: int, user_id: int, has_link: bool) -> None:
     _mem_cache[(chat_id, user_id)] = (has_link, time.monotonic())
 
 
+async def _check_vip_bio(chat_id: int, user_id: int, vip_text: str) -> bool:
+    """
+    Cek apakah user ini VIP berdasarkan teks di bionya.
+
+    Alur:
+      1. Cek _vip_bio_cache dulu (TTL = BIO_TTL_SECS, sama dengan bio link cache)
+      2. Jika cache miss → baca field "bio" dari dokumen bio_profiles yang
+         SUDAH ada (ditulis bot pemantau saat cek bio link — TIDAK ada API
+         tambahan untuk kasus ini)
+      3. Jika dokumen BELUM ADA SAMA SEKALI (user baru pertama kali terlihat,
+         atau cache TTL bio_profiles habis) → PAKSA fetch fresh via bot
+         pemantau (force_check_user), SAMA seperti yang dilakukan
+         _query_bio_for_group() untuk has_link. Tanpa ini, VIP check akan
+         selalu return False palsu pada pesan PERTAMA seorang user — dan
+         karena bio_filter() menjalankan cek VIP SEBELUM cek link, giliran
+         _query_bio_for_group() berikutnya baru memicu fetch (sudah
+         terlambat untuk pesan yang sama) → user dengan teks VIP DAN link
+         sekaligus di bio bisa salah kena hapus/hukum di pesan pertamanya,
+         padahal seharusnya teks VIP mengalahkan deteksi link.
+      4. Cek apakah vip_text ada di bio (case-insensitive)
+      5. Simpan ke cache, return hasil
+
+    Dipanggil bersamaan dengan cek bio link di bio_filter() —
+    pada user yang sudah punya data di DB, ini tetap 1 jalan / 0 API
+    tambahan seperti sebelumnya; hanya user yang BENAR-BENAR belum punya
+    data sama sekali yang memicu 1x fetch (dan fetch itu juga dipakai
+    ulang oleh _query_bio_for_group() lewat memory cache, tidak dobel).
+
+    Return:
+      True  → user VIP (bio mengandung vip_text)
+      False → user bukan VIP
+    """
+    now = time.monotonic()
+    key = (chat_id, user_id)
+
+    # Cek cache dulu
+    cached = _vip_bio_cache.get(key)
+    if cached:
+        is_vip, cache_ts = cached
+        if now - cache_ts < _VIP_BIO_CACHE_TTL:
+            return is_vip
+        del _vip_bio_cache[key]
+
+    # Baca bio dari dokumen yang sudah ada di DB (bukan fetch baru)
+    try:
+        doc = await bio_col.find_one({"chat_id": chat_id, "user_id": user_id})
+    except Exception as e:
+        print(f"[Bio-VIP] Gagal query bio_profiles chat={chat_id} uid={user_id}: {e}")
+        return False
+
+    if not doc:
+        # Data belum ada (user baru / TTL bio_profiles habis) — PAKSA fetch
+        # fresh sekarang, sama seperti _query_bio_for_group() melakukan untuk
+        # has_link. Tanpa ini, pesan pertama user akan selalu dianggap
+        # "bukan VIP" walau teksnya sudah ada di bio, karena belum pernah
+        # ada yang fetch bio-nya sama sekali.
+        try:
+            from monitor_bot_reference import force_check_user
+            await force_check_user(chat_id, user_id)
+        except Exception as e:
+            print(f"[Bio-VIP] force_check_user gagal chat={chat_id} uid={user_id}: {e}")
+            return False
+
+        try:
+            doc = await bio_col.find_one({"chat_id": chat_id, "user_id": user_id})
+        except Exception as e:
+            print(f"[Bio-VIP] Gagal re-query bio_profiles chat={chat_id} uid={user_id}: {e}")
+            return False
+
+        if not doc:
+            # Bot pemantau tidak aktif / gagal total — tidak ada data sama
+            # sekali. Tidak ada yang bisa dipastikan → anggap belum VIP,
+            # akan dicoba lagi di pesan berikutnya.
+            return False
+
+    bio_text = doc.get("bio", "") or ""
+    is_vip   = vip_text.lower() in bio_text.lower()
+
+    # Simpan ke cache
+    _vip_bio_cache[key] = (is_vip, now)
+
+    if is_vip:
+        print(f"[Bio-VIP] uid={user_id} chat={chat_id} → VIP (teks ditemukan di bio)")
+
+    return is_vip
+
+
+# ── Bio Admin Wajib (NewsCore) ──────────────────────────────────────────────
+# Throttle ringan khusus pengecekan ini, terpisah dari _mem_cache (yang
+# menyimpan has_link), agar tidak ada interaksi tak sengaja antar fitur.
+_ns_bio_check_ts: dict[tuple[int, int], float] = {}
+_NS_BIO_CHECK_COOLDOWN = _MEM_CACHE_TTL  # ikut TTL bio yang sama
+
+# ── Cache: apakah salah satu fitur bio aktif di grup ini ─────────────────────
+# Agar tidak query DB tiap pesan/typing hanya untuk cek "apakah perlu prefetch".
+# TTL = sama dengan MEM_CACHE_TTL sehingga menyesuaikan jika admin toggle fitur.
+_bio_feature_active_cache: dict[int, tuple[bool, float]] = {}
+
+
+async def _any_bio_feature_active(chat_id: int) -> bool:
+    """
+    Return True jika setidaknya SATU fitur yang membutuhkan data bio aktif
+    di grup ini: bio_check (link detector), Security OS, atau NewsCore.
+
+    Dipakai oleh typing handler agar prefetch cache bio tetap berjalan
+    meski bio_check mati — selama Security OS atau NewsCore masih butuh data bio.
+    """
+    now = time.monotonic()
+    cached = _bio_feature_active_cache.get(chat_id)
+    if cached and (now - cached[1]) < _MEM_CACHE_TTL:
+        return cached[0]
+
+    result = False
+    try:
+        cfg = await get_config(chat_id)
+        if cfg.get("bio_check"):
+            result = True
+        if not result:
+            ns_cfg = await db["newscore_config"].find_one({"chat_id": chat_id}) or {}
+            if ns_cfg.get("enabled") and ns_cfg.get("bio_admin_required", True) and ns_cfg.get("bio_admin_text", "").strip():
+                result = True
+        if not result:
+            secos_doc = await db["security_os"].find_one({"chat_id": chat_id}) or {}
+            if secos_doc.get("enabled"):
+                result = True
+    except Exception as e:
+        print(f"[Bio] _any_bio_feature_active error chat={chat_id}: {e}")
+        result = False
+
+    _bio_feature_active_cache[chat_id] = (result, now)
+    return result
+
+
+def _invalidate_bio_feature_cache(chat_id: int) -> None:
+    """Hapus cache _any_bio_feature_active saat toggle berubah."""
+    _bio_feature_active_cache.pop(chat_id, None)
+
+
+async def _check_ns_admin_bio(client: Client, chat_id: int, user_id: int) -> None:
+    """
+    Dipicu setiap ada pesan dari user di grup (group=1, sebelum skip-admin).
+    Jika user adalah admin NewsCore aktif → pastikan bio sudah dicek fresh,
+    baca hasil admin_bio_ok, lalu unadmin via core.ns_bio_guard jika perlu.
+
+    Tidak mempengaruhi pesan yang sedang diproses sama sekali (tidak hapus,
+    tidak mark_message_handled) — berjalan independen sebagai background task.
+    """
+    try:
+        from database import ns_get_config, ns_get_current_admins
+        ns_cfg = await ns_get_config(chat_id)
+        if not ns_cfg.get("enabled"):
+            return
+
+        ns_admins = await ns_get_current_admins(chat_id)
+        if user_id not in {a["user_id"] for a in ns_admins}:
+            return  # bukan admin NewsCore — tidak relevan
+
+        # Throttle agar tidak query/trigger berulang dalam waktu singkat
+        now = time.monotonic()
+        key = (chat_id, user_id)
+        last = _ns_bio_check_ts.get(key, 0)
+        if now - last < _NS_BIO_CHECK_COOLDOWN:
+            return
+        _ns_bio_check_ts[key] = now
+
+        from monitor_bot_reference import query_admin_bio_ok, force_check_user
+        admin_bio_ok = await query_admin_bio_ok(chat_id, user_id)
+        if admin_bio_ok is None:
+            # Data belum ada / expired → paksa bot pemantau cek fresh
+            # (force_check_user juga otomatis menulis admin_bio_ok)
+            await force_check_user(chat_id, user_id)
+            admin_bio_ok = await query_admin_bio_ok(chat_id, user_id)
+
+        if admin_bio_ok is False:
+            from core.ns_bio_guard import enforce_admin_bio
+            await enforce_admin_bio(client, chat_id, user_id, admin_bio_ok)
+    except Exception as e:
+        print(f"[NS-BioGuard] _check_ns_admin_bio error chat={chat_id} uid={user_id}: {e}")
+
+
 # ── Handler pesan masuk ────────────────────────────────────────────────────────
 
-@Client.on_message(filters.group & ~filters.service, group=1)
+@Client.on_message((filters.group | filters.forum) & ~filters.service, group=1)
 async def bio_filter(client: Client, message: Message):
     if not message.from_user or message.from_user.is_bot:
         return
@@ -137,7 +331,17 @@ async def bio_filter(client: Client, message: Message):
     if is_message_handled(cid, mid):
         return
 
+    # ── Cek izin bot: HARUS punya delete_messages DAN restrict_members ───────
+    if not await check_bot_permissions(client, cid):
+        return
+
     cfg = await get_config(cid)
+
+    # ── Bio Admin Wajib (NewsCore) — dicek SEBELUM skip-admin di bawah,
+    # karena justru admin (yang diangkat NewsCore) yang perlu diperiksa di sini.
+    # Tidak menghapus pesan ini sama sekali — hanya trigger unadmin jika perlu.
+    asyncio.create_task(_check_ns_admin_bio(client, cid, uid))
+
     if not cfg["bio_check"]:
         return
 
@@ -147,18 +351,58 @@ async def bio_filter(client: Client, message: Message):
     if await free_col.find_one({"user_id": uid, "chat_id": cid}):
         return
 
+    # ── VIP Bio: cek bersamaan dengan bio link (1 jalan, 0 API tambahan) ──────
+    # vip_text hanya dipakai jika bio_check aktif (sudah dicek di atas).
+    # Cek VIP SEBELUM step 1 agar user VIP tidak terkena penghapusan
+    # walau has_link=True sekalipun.
+    vip_text = (cfg.get("bio_vip_text") or "").strip()
+    if vip_text:
+        is_vip = await _check_vip_bio(cid, uid, vip_text)
+        if is_vip:
+            # User baru terdeteksi VIP lewat teks bio — daftarkan ke
+            # free_per_group (source="bio_vip") + buka mute jika ada.
+            # Lihat core/vip_bio_guard.py untuk detail alur lengkapnya.
+            from core.vip_bio_guard import maybe_enter_vip_bio
+            asyncio.create_task(maybe_enter_vip_bio(client, cid, uid))
+            return  # User VIP → bebas dari seluruh pengecekan bio
+
     # ── Step 1: Cek data dari DB (data bot pemantau grup ini) ─────────────────
     has_link = await _query_bio_for_group(cid, uid)
 
     # ── Step 2: Tidak ada data → paksa bot pemantau cek langsung ─────────────
     if has_link is None:
+        # Cek dulu: kalau grup ini sedang menunggu slot Bengkel (semua
+        # Bengkel sibuk di grup lain), force_check_user PASTI timeout 30s
+        # (queue instance ini menumpuk, tidak ada yang konsumsi selagi
+        # pending). Lompat langsung ke workshop_pool standalone supaya tidak
+        # bikin pesan user menunggu lama tanpa alasan.
+        skip_force_check = False
         try:
-            from monitor_bot_reference import force_check_user
-            has_link = await force_check_user(cid, uid)
-            if has_link is not None:
-                _update_mem_cache(cid, uid, has_link)
+            from core.workshop_join_pool import is_pending_for_bengkel
+            skip_force_check = is_pending_for_bengkel(cid)
         except Exception:
             pass
+
+        if not skip_force_check:
+            try:
+                from monitor_bot_reference import force_check_user
+                has_link = await force_check_user(cid, uid)
+                if has_link is not None:
+                    _update_mem_cache(cid, uid, has_link)
+            except Exception:
+                pass
+        # FALLBACK BENGKEL: MonitorInstance grup ini tidak aktif/gagal
+        # (belum setup token monitor, atau sedang FloodWait) → coba pool
+        # token backup (workshop_pool). Hasilnya ditulis ke bio_profiles
+        # dengan field sama persis, jadi transparan untuk semua consumer.
+        if has_link is None:
+            try:
+                from core.workshop_pool import workshop_pool
+                has_link = await workshop_pool.check_and_save(cid, uid)
+                if has_link is not None:
+                    _update_mem_cache(cid, uid, has_link)
+            except Exception as e:
+                print(f"[Bio-Filter] Bengkel fallback gagal chat={cid} uid={uid}: {e}")
         # BUG 4+5 FIX: Jika bot pemantau tidak bisa cek (user tidak dikenali/bio kosong)
         # → anggap tidak ada link (bio kosong = no link)
         # → biarkan pesan lewat, jangan hapus tanpa data yang valid
@@ -182,6 +426,7 @@ async def bio_filter(client: Client, message: Message):
                 uid,
                 message.from_user.first_name or str(uid),
                 (message.text or message.caption or "")[:100],
+                jenis=VIOLATION_BIO_LINK,
             )
         except Exception:
             pass
@@ -240,20 +485,44 @@ async def bio_typing_handler(client: Client, update, users, chats):
             return
         _typing_trigger_ts[key] = now
 
-        # Cek konfigurasi bio_check aktif di grup ini
-        try:
-            cfg = await get_config(chat_id)
-            if not cfg.get("bio_check"):
-                return
-        except Exception:
+        # ── Bio Admin Wajib (NewsCore) — independen dari toggle bio_check
+        # member di bawah, karena ini soal kewajiban admin, bukan filter link.
+        asyncio.create_task(_check_ns_admin_bio(client, chat_id, user_id))
+
+        # ── Cek izin bot: HARUS punya delete_messages DAN restrict_members ───
+        # Khusus untuk jalur filter link-di-bio (hapus pesan). Jika tidak ada
+        # → skip grup ini sepenuhnya untuk jalur ini (tidak query config/VIP/
+        # bio sama sekali, tidak trigger force_check_user).
+        if not await check_bot_permissions(client, chat_id):
             return
 
-        # Cek data di DB dulu — jika ada, tidak perlu trigger
+        # ── Cek apakah SETIDAKNYA SATU fitur yang butuh data bio aktif ───────
+        # bio_check = filter link bio biasa
+        # Security OS / NewsCore = fitur lain yang juga butuh data bio di DB
+        # Jika semua OFF → tidak ada gunanya prefetch, langsung return.
+        if not await _any_bio_feature_active(chat_id):
+            return
+
+        cfg = await get_config(chat_id)
+
+        # ── VIP Bio: hanya relevan jika bio_check aktif ───────────────────────
+        if cfg.get("bio_check"):
+            vip_text = (cfg.get("bio_vip_text") or "").strip()
+            if vip_text:
+                is_vip = await _check_vip_bio(chat_id, user_id, vip_text)
+                if is_vip:
+                    from core.vip_bio_guard import maybe_enter_vip_bio
+                    asyncio.create_task(maybe_enter_vip_bio(client, chat_id, user_id))
+                    return  # User VIP → tidak perlu trigger bot pemantau
+
+        # ── Prefetch cache bio jika data tidak ada / expired ─────────────────
+        # Berjalan selama SALAH SATU fitur yang butuh data bio aktif,
+        # bukan hanya saat bio_check aktif.
         has_link = await _query_bio_for_group(chat_id, user_id)
         if has_link is not None:
             return  # Data sudah ada dan masih valid
 
-        # Data tidak ada / expired → trigger bot pemantau
+        # Data tidak ada / expired → trigger bot pemantau untuk isi cache
         try:
             from monitor_bot_reference import force_check_user
             result = await force_check_user(chat_id, user_id)
@@ -264,7 +533,21 @@ async def bio_typing_handler(client: Client, update, users, chats):
                     f"→ pre-fetch bio, has_link={result}"
                 )
         except Exception:
-            pass
+            result = None
+        # FALLBACK BENGKEL: sama seperti bio_filter — kalau MonitorInstance
+        # grup ini tidak aktif/gagal, coba pool token backup.
+        if result is None:
+            try:
+                from core.workshop_pool import workshop_pool
+                result = await workshop_pool.check_and_save(chat_id, user_id)
+                if result is not None:
+                    _update_mem_cache(chat_id, user_id, result)
+                    print(
+                        f"[Bio-Typing] uid={user_id} chat={chat_id} "
+                        f"→ pre-fetch bio via Bengkel, has_link={result}"
+                    )
+            except Exception as e:
+                print(f"[Bio-Typing] Bengkel fallback gagal chat={chat_id} uid={user_id}: {e}")
 
     except Exception as e:
         print(f"[Bio-Typing] Error raw handler: {e}")
@@ -274,10 +557,11 @@ async def _log_bio_deletion(client: Client, message: Message):
     if not LOG_CHANNEL:
         return
 
+    from plugins.commands.log import _user_line, _fmt_waktu
+
     uid          = message.from_user.id
     cid          = message.chat.id
-    user_mention = f"<a href='tg://user?id={uid}'>{message.from_user.first_name}</a>"
-    waktu        = datetime.now(TZ_WIB).strftime("%d/%m/%Y %H:%M:%S WIB")
+    user_mention = _user_line(uid, message.from_user.first_name)
     content      = (message.text or message.caption or "").strip()
 
     # Ambil bio dari DB (data khusus grup ini)
@@ -288,15 +572,14 @@ async def _log_bio_deletion(client: Client, message: Message):
         bio_snippet = "(tidak diketahui)"
 
     log_text = (
-        "<b>❖ BIO LINK DETECTOR ❖</b>\n"
-        "🔍 <b>Pesan Dihapus — Tautan di Bio</b>\n"
-        "<blockquote>"
-        f"◈ <b>User:</b> {user_mention} (<code>{uid}</code>)\n"
-        f"◈ <b>Grup:</b> {message.chat.title} (<code>{cid}</code>)\n"
-        f"◈ <b>Waktu:</b> {waktu}\n"
-        f"◈ <b>Bio:</b> <code>{bio_snippet}</code>\n\n"
-        f"<b>Konten pesan:</b> <code>{content[:400]}</code>"
-        "</blockquote>"
+        f"<b>❖ {format_violation_header(VIOLATION_BIO_LINK)} ❖</b>\n"
+        f"◈ <b>User:</b> {user_mention}\n"
+        f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
+        f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
+        f"◈ <b>Keterangan:</b> Bio profil Telegram user mengandung link\n"
+        f"◈ <b>Kebijakan:</b> Grup ini tidak mengizinkan member dengan bio berisi link\n"
+        f"◈ <b>Bio terdeteksi:</b> <code>{html.escape(str(bio_snippet))}</code>\n\n"
+        f"📨 <b>Pesan terakhir:</b>\n<code>{html.escape(content[:400])}</code>"
     )
     try:
         await client.send_message(
