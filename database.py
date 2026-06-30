@@ -2573,7 +2573,7 @@ async def refresh_group_public_info(client, chat_id: int) -> None:
     Dipanggil dengan try/except oleh caller — fungsi ini sendiri tidak
     melempar exception ke pemanggil untuk error apapun selain bug internal.
     """
-    from pyrogram.errors import ChatAdminRequired, UserNotParticipant, FloodWait
+    from pyrogram.errors import ChatAdminRequired, UserNotParticipant, FloodWait, BadRequest
 
     try:
         chat = await client.get_chat(chat_id)
@@ -2598,6 +2598,14 @@ async def refresh_group_public_info(client, chat_id: int) -> None:
         pass  # tidak ada izin undang — skip, jangan error
     except FloodWait:
         pass  # rate limit sesaat — coba lagi siklus watchdog berikutnya
+    except BadRequest as e:
+        # Beberapa tipe chat tidak mendukung invite link sama sekali, mis.
+        # CHANNEL_MONOFORUM_UNSUPPORTED (channel dengan mode forum satu-arah)
+        # — ini bukan masalah izin/rate-limit, dan tidak akan pernah berhasil
+        # walau di-retry. Skip diam-diam supaya log tidak penuh noise untuk
+        # kondisi yang memang tidak bisa diperbaiki.
+        if "MONOFORUM" not in str(e).upper():
+            print(f"[GroupInfo] export invite link ditolak grup {chat_id}: {e}")
     except Exception as e:
         print(f"[GroupInfo] Gagal export invite link grup {chat_id}: {e}")
 

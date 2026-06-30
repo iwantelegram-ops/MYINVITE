@@ -923,9 +923,10 @@ async def main():
     # Deploy watcher — deteksi jika ada deploy baru selama bot berjalan → auto shutdown
     asyncio.create_task(_deploy_watch_and_release())
 
-    # Nexus midnight scheduler
-    from plugins.nexus.engine import cron_midnight_scheduler
-    asyncio.create_task(cron_midnight_scheduler())
+    # Nexus midnight scheduler dinonaktifkan — passive collection (auto-tulis corpus
+    # dari setiap pesan spam yang dihapus) sudah tidak dipakai. Regenerasi regex
+    # dari corpus yang tidak diisi lagi tidak ada gunanya.
+    # Corpus tetap bisa diisi via /spam (laporan manual admin grup).
 
     # Jalankan bot
     try:
