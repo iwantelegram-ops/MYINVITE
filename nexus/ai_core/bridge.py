@@ -165,6 +165,16 @@ async def nexus_ai_passive_observe(
                           rate limit anti-poisoning
     """
     try:
+        # Passive collection (pencatatan otomatis dari setiap pesan yang
+        # lewat) DINONAKTIFKAN — Nexus AI Core sekarang hanya memakai
+        # kemampuan deteksi bawaannya (Bayes+Feature/CategoryDetector/regex)
+        # untuk menghapus pesan di grup ber-toggle "Anti Spam AI", tanpa lagi
+        # diam-diam mencatat data dari pesan yang lewat.
+        #
+        # Corpus tetap bisa diisi MANUAL via /spam oleh admin grup — itu lewat
+        # nexus_ai_learn_spam(), bukan fungsi ini, jadi tidak terdampak.
+        return
+
         from nexus.ai_core.passive_learner import get_passive_learner
         pl = get_passive_learner()
 
