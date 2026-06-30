@@ -39,8 +39,9 @@ FLOW DI DM (deep-link ?start=govip_<chat_id>):
   Jika payload govip valid (grup ditemukan & VIP Bio masih aktif):
     Tampilkan tutorial pasang teks VIP bio (font monospace),
     daftar SEMUA filter/antispam yang akan dilewati di grup itu
-    (di-list satu per satu), dan penjelasan mini + tombol untuk
-    menambahkan bot ke grup lain dengan kuasa admin penuh.
+    (di-list satu per satu), dan tombol "🔎 Lihat Fitur Full" yang
+    memicu balasan /start biasa di DM yang sama (lewat callback_data,
+    bukan deep-link baru) — bukan lagi tombol "Tambahkan Bot ke Grup".
 """
 
 import time
@@ -235,12 +236,6 @@ async def govip_start_intercept(client: Client, message: Message):
         "8️⃣ Mute Mic Otomatis (Security OS — Obrolan Suara)"
     )
 
-    try:
-        me = client.me
-        add_url = f"https://t.me/{me.username}?startgroup=true&admin={_FULL_ADMIN_RIGHTS}"
-    except Exception:
-        add_url = None
-
     text = (
         "⭐ <b>Cara Jadi VIP Member</b>\n"
         f"<code>Grup: {group_name}</code>\n"
@@ -255,11 +250,9 @@ async def govip_start_intercept(client: Client, message: Message):
         "<i>aktifkan bot ini di grupmu</i>"
     )
 
-    keyboard = None
-    if add_url:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Tambahkan Bot ke Grup", url=add_url)],
-        ])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Lihat Fitur Full", callback_data="govip_show_features")],
+    ])
 
     await message.reply(
         text,
@@ -268,3 +261,24 @@ async def govip_start_intercept(client: Client, message: Message):
         disable_web_page_preview=True,
     )
     raise StopPropagation
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Tombol "🔎 Lihat Fitur Full" — memicu balasan /start biasa di DM yang sama
+# ─────────────────────────────────────────────────────────────────────────────
+@Client.on_callback_query(filters.regex(r"^govip_show_features$"))
+async def govip_show_features_cb(client: Client, cq):
+    try:
+        from plugins.ui.pages import page_start
+        start_text, start_keyboard = await page_start(client)
+        await client.send_message(
+            chat_id=cq.from_user.id,
+            text=start_text,
+            reply_markup=start_keyboard,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        await cq.answer()
+    except Exception as e:
+        print(f"[GoVIP] Gagal kirim start dari tombol fitur full: {e}")
+        await cq.answer("Gagal memuat, coba lagi.", show_alert=True)
